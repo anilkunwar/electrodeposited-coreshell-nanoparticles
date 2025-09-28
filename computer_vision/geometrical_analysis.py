@@ -29,28 +29,23 @@ if uploaded_files:
     scale_factors = {}
 
     for i, img in enumerate(images):
-        st.write(f"Click two points on the scale bar for Image {i+1}")
-        img_pil = Image.fromarray(img)
-        coords = [None, None]
-        def get_coords(x, y):
-            if coords[0] is None:
-                coords[0] = (x, y)
-            elif coords[1] is None:
-                coords[1] = (x, y)
-            scale_bar_coords[i] = coords
-        st.image(img, use_column_width=True, output="canvas", on_click=get_coords)
+        st.write(f"Enter pixel coordinates for the two ends of the scale bar for Image {i+1}")
+        col1, col2 = st.columns(2)
+        with col1:
+            x1 = st.number_input(f"X1 for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=0, key=f"x1_{i}")
+            y1 = st.number_input(f"Y1 for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=0, key=f"y1_{i}")
+        with col2:
+            x2 = st.number_input(f"X2 for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=img.shape[1]//2, key=f"x2_{i}")
+            y2 = st.number_input(f"Y2 for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=img.shape[0]//2, key=f"y2_{i}")
+        
         if st.button(f"Confirm Scale Bar Points for Image {i+1}"):
-            if scale_bar_coords.get(i) and None not in scale_bar_coords[i]:
-                x1, y1 = scale_bar_coords[i][0]
-                x2, y2 = scale_bar_coords[i][1]
-                pixel_distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-                if pixel_distance > 0:
-                    scale_factors[i] = scale_bar_nm / pixel_distance
-                    st.success(f"Scale factor for Image {i+1}: {scale_factors[i]:.2f} nm/pixel")
-                else:
-                    st.error("Invalid scale bar points: zero distance detected.")
+            scale_bar_coords[i] = [(x1, y1), (x2, y2)]
+            pixel_distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            if pixel_distance > 0:
+                scale_factors[i] = scale_bar_nm / pixel_distance
+                st.success(f"Scale factor for Image {i+1}: {scale_factors[i]:.2f} nm/pixel")
             else:
-                st.error(f"Please click two distinct points for Image {i+1}.")
+                st.error("Invalid scale bar points: zero distance detected.")
 
     # Segmentation parameters
     st.subheader("Segmentation Parameters")
