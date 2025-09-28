@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 # Streamlit app title
-st.title("Core-Shell Nanoparticle Analysis with Coordinate System (Color TEM)")
+st.title("Core-Shell Nanoparticle Analysis with Coordinate System and Measurement Tools (Color TEM)")
 
 # File uploader for TEM images
 uploaded_files = st.file_uploader("Upload TEM Image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
@@ -17,10 +17,19 @@ if uploaded_files:
         image = Image.open(uploaded_file).convert("RGB")
         images.append(np.array(image))
     
-    # Display uploaded images
-    st.subheader("Uploaded Images")
+    # Display uploaded images with pixel scales (GIMP-like boundary scales)
+    st.subheader("Uploaded Images with Pixel Scales")
     for i, img in enumerate(images):
-        st.image(img, caption=f"Image {i+1}", use_column_width=True)
+        fig, ax = plt.subplots()
+        ax.imshow(img)
+        ax.set_xlabel("X (pixels)")
+        ax.set_ylabel("Y (pixels)")
+        # Set ticks for rulers
+        ax.set_xticks(np.arange(0, img.shape[1], step=max(1, img.shape[1]//10)))
+        ax.set_yticks(np.arange(0, img.shape[0], step=max(1, img.shape[0]//10)))
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+        st.pyplot(fig)
+        st.caption(f"Image {i+1} - Size: {img.shape[1]} x {img.shape[0]} pixels")
 
     # Interactive scale bar calibration
     st.subheader("Scale Bar Calibration")
@@ -46,6 +55,41 @@ if uploaded_files:
                 st.success(f"Scale factor for Image {i+1}: {scale_factors[i]:.2f} nm/pixel")
             else:
                 st.error("Invalid scale bar points: zero distance detected.")
+
+    # Interactive Measurement Tool with Sliders
+    st.subheader("Interactive Measurement Tool")
+    selected_image_idx = st.selectbox("Select Image for Measurement", options=range(len(images)), format_func=lambda x: f"Image {x+1}")
+    if selected_image_idx is not None:
+        img = images[selected_image_idx]
+        height, width = img.shape[:2]
+        
+        # Sliders for X and Y positions
+        x_pos = st.slider("X Position (pixels)", 0, width - 1, width // 2)
+        y_pos = st.slider("Y Position (pixels)", 0, height - 1, height // 2)
+        
+        # Draw crosshair on the image
+        img_with_crosshair = img.copy()
+        cv2.line(img_with_crosshair, (x_pos, 0), (x_pos, height), (255, 255, 0), 1)  # Vertical line
+        cv2.line(img_with_crosshair, (0, y_pos), (width, y_pos), (255, 255, 0), 1)  # Horizontal line
+        cv2.circle(img_with_crosshair, (x_pos, y_pos), 5, (255, 0, 0), 2)  # Center point
+        
+        st.image(img_with_crosshair, caption=f"Image {selected_image_idx+1} with Measurement Crosshair", use_column_width=True)
+        
+        # Display coordinates
+        st.write(f"Current Position (pixels): ({x_pos}, {y_pos})")
+        
+        if selected_image_idx in scale_factors:
+            scale_factor = scale_factors[selected_image_idx]
+            x_nm = x_pos * scale_factor
+            y_nm = y_pos * scale_factor  # Note: Y is from top, but since bottom-left is (0,0), adjust if needed
+            st.write(f"Current Position (nm): ({x_nm:.2f}, {y_nm:.2f}) (from top-left)")
+        
+        # Example computation: Distance from origin (bottom-left)
+        distance_pixels = np.sqrt(x_pos**2 + (height - y_pos)**2)  # Assuming bottom-left as (0,0)
+        st.write(f"Distance from Bottom-Left (pixels): {distance_pixels:.2f}")
+        if selected_image_idx in scale_factors:
+            distance_nm = distance_pixels * scale_factor
+            st.write(f"Distance from Bottom-Left (nm): {distance_nm:.2f}")
 
     # Segmentation parameters
     st.subheader("Segmentation Parameters")
