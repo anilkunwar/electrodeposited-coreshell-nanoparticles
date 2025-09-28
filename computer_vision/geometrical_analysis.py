@@ -31,9 +31,8 @@ if uploaded_files:
         st.pyplot(fig)
         st.caption(f"Image {i+1} - Size: {img.shape[1]} x {img.shape[0]} pixels")
 
-    # Interactive scale bar calibration
+    # Interactive scale bar calibration using Point 1 and Point 2
     st.subheader("Scale Bar Calibration")
-    scale_bar_nm = st.number_input("Enter scale bar length (nm):", min_value=1.0, value=20.0)
     scale_bar_coords = {}
     scale_factors = {}
 
@@ -42,10 +41,12 @@ if uploaded_files:
         col1, col2 = st.columns(2)
         with col1:
             x1 = st.number_input(f"X1 for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=0, key=f"x1_{i}")
-            y1 = st.number_input(f"Y1 for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=0, key=f"y1_{i}")
+            y1 = st.number_input(f"Y1 for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=img.shape[0]-1, key=f"y1_{i}")
         with col2:
             x2 = st.number_input(f"X2 for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=img.shape[1]//2, key=f"x2_{i}")
             y2 = st.number_input(f"Y2 for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=img.shape[0]//2, key=f"y2_{i}")
+        
+        scale_bar_nm = st.number_input(f"Scale bar length (nm) for Image {i+1}", min_value=1.0, value=20.0, key=f"nm_{i}")
         
         if st.button(f"Confirm Scale Bar Points for Image {i+1}"):
             scale_bar_coords[i] = [(x1, y1), (x2, y2)]
@@ -63,29 +64,30 @@ if uploaded_files:
         img = images[selected_image_idx]
         height, width = img.shape[:2]
         
-        # Sliders for X and Y positions
+        # Sliders for X and Y positions (Y starts from bottom)
         x_pos = st.slider("X Position (pixels)", 0, width - 1, width // 2)
         y_pos = st.slider("Y Position (pixels)", 0, height - 1, height // 2)
+        y_pos_bottom = height - 1 - y_pos  # Invert Y to start from bottom
         
         # Draw crosshair on the image
         img_with_crosshair = img.copy()
         cv2.line(img_with_crosshair, (x_pos, 0), (x_pos, height), (255, 255, 0), 1)  # Vertical line
-        cv2.line(img_with_crosshair, (0, y_pos), (width, y_pos), (255, 255, 0), 1)  # Horizontal line
-        cv2.circle(img_with_crosshair, (x_pos, y_pos), 5, (255, 0, 0), 2)  # Center point
+        cv2.line(img_with_crosshair, (0, y_pos), (width, y_pos), (255, 255, 0), 1)  # Horizontal line (original Y)
+        cv2.circle(img_with_crosshair, (x_pos, y_pos_bottom), 5, (255, 0, 0), 2)  # Center point at bottom-based Y
         
         st.image(img_with_crosshair, caption=f"Image {selected_image_idx+1} with Measurement Crosshair", use_column_width=True)
         
-        # Display coordinates
-        st.write(f"Current Position (pixels): ({x_pos}, {y_pos})")
+        # Display coordinates (bottom-left as 0,0)
+        st.write(f"Current Position (pixels): ({x_pos}, {y_pos_bottom})")
         
         if selected_image_idx in scale_factors:
             scale_factor = scale_factors[selected_image_idx]
             x_nm = x_pos * scale_factor
-            y_nm = y_pos * scale_factor  # Note: Y is from top, but since bottom-left is (0,0), adjust if needed
-            st.write(f"Current Position (nm): ({x_nm:.2f}, {y_nm:.2f}) (from top-left)")
+            y_nm = y_pos_bottom * scale_factor  # Y in nm from bottom
+            st.write(f"Current Position (nm): ({x_nm:.2f}, {y_nm:.2f}) (bottom-left as 0,0)")
         
         # Example computation: Distance from origin (bottom-left)
-        distance_pixels = np.sqrt(x_pos**2 + (height - y_pos)**2)  # Assuming bottom-left as (0,0)
+        distance_pixels = np.sqrt(x_pos**2 + y_pos_bottom**2)
         st.write(f"Distance from Bottom-Left (pixels): {distance_pixels:.2f}")
         if selected_image_idx in scale_factors:
             distance_nm = distance_pixels * scale_factor
@@ -107,12 +109,14 @@ if uploaded_files:
             st.write(f"Processing Image {idx+1}...")
             scale_factor = scale_factors[idx]
             x1, y1 = scale_bar_coords[idx][0]
+            y1_bottom = height - 1 - y1  # Convert to bottom-based Y
             x2, y2 = scale_bar_coords[idx][1]
+            y2_bottom = height - 1 - y2  # Convert to bottom-based Y
             height, width = img.shape[:2]
 
-            # Calculate corner coordinates in nm
-            top_left_nm = (0, height * scale_factor)
-            top_right_nm = (width * scale_factor, height * scale_factor)
+            # Calculate corner coordinates in nm (bottom-left as 0,0)
+            top_left_nm = (0, (height - 1) * scale_factor)
+            top_right_nm = (width * scale_factor, (height - 1) * scale_factor)
             bottom_right_nm = (width * scale_factor, 0)
 
             st.write(f"Coordinate System (nm) for Image {idx+1}:")
@@ -158,7 +162,9 @@ if uploaded_files:
                     for green_cnt in green_contours:
                         if cv2.contourArea(green_cnt) > min_particle_area:
                             (x_shell, y_shell), shell_radius_pixels = cv2.minEnclosingCircle(green_cnt)
-                            if abs(x - x_shell) < 10 and abs(y - y_shell) < 10 and shell_radius_pixels > core_radius_pixels:
+                            y_bottom = height - 1 - y  # Convert to bottom-based Y for comparison
+                            y_shell_bottom = height - 1 - y_shell  # Convert to bottom-based Y for comparison
+                            if abs(x - x_shell) < 10 and abs(y_bottom - y_shell_bottom) < 10 and shell_radius_pixels > core_radius_pixels:
                                 shell_radius_nm = shell_radius_pixels * scale_factor
                                 shell_thickness_nm = (shell_radius_pixels - core_radius_pixels) * scale_factor
                                 shell_radii.append(shell_radius_nm)
