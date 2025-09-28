@@ -23,7 +23,7 @@ if uploaded_files:
         fig, ax = plt.subplots()
         ax.imshow(img)
         ax.set_xlabel("X (pixels)")
-        ax.set_ylabel("Y (pixels)")
+        ax.set_ylabel("Y (pixels from top)")
         # Set ticks for rulers
         ax.set_xticks(np.arange(0, img.shape[1], step=max(1, img.shape[1]//10)))
         ax.set_yticks(np.arange(0, img.shape[0], step=max(1, img.shape[0]//10)))
@@ -31,67 +31,99 @@ if uploaded_files:
         st.pyplot(fig)
         st.caption(f"Image {i+1} - Size: {img.shape[1]} x {img.shape[0]} pixels")
 
-    # Interactive scale bar calibration using Point 1 and Point 2
+    # Interactive scale bar calibration using S1 and S2
     st.subheader("Scale Bar Calibration")
     scale_bar_coords = {}
     scale_factors = {}
 
     for i, img in enumerate(images):
-        st.write(f"Enter pixel coordinates for the two ends of the scale bar for Image {i+1}")
+        st.write(f"Enter pixel coordinates for S1 and S2 (ends of the scale bar) for Image {i+1}")
         col1, col2 = st.columns(2)
         with col1:
-            x1 = st.number_input(f"X1 for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=0, key=f"x1_{i}")
-            y1 = st.number_input(f"Y1 for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=img.shape[0]-1, key=f"y1_{i}")
+            s1_x = st.number_input(f"S1 X for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=0, key=f"s1_x_{i}")
+            s1_y = st.number_input(f"S1 Y for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=0, key=f"s1_y_{i}")
         with col2:
-            x2 = st.number_input(f"X2 for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=img.shape[1]//2, key=f"x2_{i}")
-            y2 = st.number_input(f"Y2 for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=img.shape[0]//2, key=f"y2_{i}")
+            s2_x = st.number_input(f"S2 X for Image {i+1}", min_value=0, max_value=img.shape[1]-1, value=img.shape[1]//2, key=f"s2_x_{i}")
+            s2_y = st.number_input(f"S2 Y for Image {i+1}", min_value=0, max_value=img.shape[0]-1, value=img.shape[0]//2, key=f"s2_y_{i}")
         
         scale_bar_nm = st.number_input(f"Scale bar length (nm) for Image {i+1}", min_value=1.0, value=20.0, key=f"nm_{i}")
         
         if st.button(f"Confirm Scale Bar Points for Image {i+1}"):
-            scale_bar_coords[i] = [(x1, y1), (x2, y2)]
-            pixel_distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            scale_bar_coords[i] = [(s1_x, s1_y), (s2_x, s2_y)]
+            pixel_distance = np.sqrt((s2_x - s1_x)**2 + (s2_y - s1_y)**2)
             if pixel_distance > 0:
                 scale_factors[i] = scale_bar_nm / pixel_distance
                 st.success(f"Scale factor for Image {i+1}: {scale_factors[i]:.2f} nm/pixel")
             else:
                 st.error("Invalid scale bar points: zero distance detected.")
 
-    # Interactive Measurement Tool with Sliders
+    # Interactive Measurement Tool with Sliders for Two Points
     st.subheader("Interactive Measurement Tool")
     selected_image_idx = st.selectbox("Select Image for Measurement", options=range(len(images)), format_func=lambda x: f"Image {x+1}")
     if selected_image_idx is not None:
         img = images[selected_image_idx]
         height, width = img.shape[:2]
         
-        # Sliders for X and Y positions (Y starts from bottom)
-        x_pos = st.slider("X Position (pixels)", 0, width - 1, width // 2)
-        y_pos = st.slider("Y Position (pixels)", 0, height - 1, height // 2)
-        y_pos_bottom = height - 1 - y_pos  # Invert Y to start from bottom
+        # Define fixed corner points B1, B2, B3, B4 (top-left as (0,0))
+        b1 = (0, 0)  # Top-left
+        b2 = (width - 1, 0)  # Top-right
+        b3 = (width - 1, height - 1)  # Bottom-right
+        b4 = (0, height - 1)  # Bottom-left
         
-        # Draw crosshair on the image
-        img_with_crosshair = img.copy()
-        cv2.line(img_with_crosshair, (x_pos, 0), (x_pos, height), (255, 255, 0), 1)  # Vertical line
-        cv2.line(img_with_crosshair, (0, y_pos), (width, y_pos), (255, 255, 0), 1)  # Horizontal line (original Y)
-        cv2.circle(img_with_crosshair, (x_pos, y_pos_bottom), 5, (255, 0, 0), 2)  # Center point at bottom-based Y
-        
-        st.image(img_with_crosshair, caption=f"Image {selected_image_idx+1} with Measurement Crosshair", use_column_width=True)
-        
-        # Display coordinates (bottom-left as 0,0)
-        st.write(f"Current Position (pixels): ({x_pos}, {y_pos_bottom})")
+        st.write("Fixed Corner Coordinates (pixels):")
+        st.write(f"B1 (Top-Left): {b1}")
+        st.write(f"B2 (Top-Right): {b2}")
+        st.write(f"B3 (Bottom-Right): {b3}")
+        st.write(f"B4 (Bottom-Left): {b4}")
         
         if selected_image_idx in scale_factors:
             scale_factor = scale_factors[selected_image_idx]
-            x_nm = x_pos * scale_factor
-            y_nm = y_pos_bottom * scale_factor  # Y in nm from bottom
-            st.write(f"Current Position (nm): ({x_nm:.2f}, {y_nm:.2f}) (bottom-left as 0,0)")
+            b1_nm = (b1[0] * scale_factor, b1[1] * scale_factor)
+            b2_nm = (b2[0] * scale_factor, b2[1] * scale_factor)
+            b3_nm = (b3[0] * scale_factor, b3[1] * scale_factor)
+            b4_nm = (b4[0] * scale_factor, b4[1] * scale_factor)
+            st.write("Fixed Corner Coordinates (nm):")
+            st.write(f"B1 (Top-Left): ({b1_nm[0]:.2f}, {b1_nm[1]:.2f})")
+            st.write(f"B2 (Top-Right): ({b2_nm[0]:.2f}, {b2_nm[1]:.2f})")
+            st.write(f"B3 (Bottom-Right): ({b3_nm[0]:.2f}, {b3_nm[1]:.2f})")
+            st.write(f"B4 (Bottom-Left): ({b4_nm[0]:.2f}, {b4_nm[1]:.2f})")
         
-        # Example computation: Distance from origin (bottom-left)
-        distance_pixels = np.sqrt(x_pos**2 + y_pos_bottom**2)
-        st.write(f"Distance from Bottom-Left (pixels): {distance_pixels:.2f}")
+        # Relative width and height
+        relative_width_pixels = b2[0] - b1[0]
+        relative_height_pixels = b4[1] - b1[1]
+        st.write(f"Relative Width (B2 - B1 X): {relative_width_pixels} pixels")
+        st.write(f"Relative Height (B4 - B1 Y): {relative_height_pixels} pixels")
+        if selected_image_idx in scale_factors:
+            relative_width_nm = relative_width_pixels * scale_factor
+            relative_height_nm = relative_height_pixels * scale_factor
+            st.write(f"Relative Width (nm): {relative_width_nm:.2f}")
+            st.write(f"Relative Height (nm): {relative_height_nm:.2f}")
+        
+        # Sliders for two arbitrary points P1 and P2 to measure distance
+        st.write("Select two points P1 and P2 to measure distance:")
+        col1, col2 = st.columns(2)
+        with col1:
+            p1_x = st.slider("P1 X Position", 0, width - 1, 0)
+            p1_y = st.slider("P1 Y Position (from top)", 0, height - 1, 0)
+        with col2:
+            p2_x = st.slider("P2 X Position", 0, width - 1, width // 2)
+            p2_y = st.slider("P2 Y Position (from top)", 0, height - 1, height // 2)
+        
+        # Draw markers and line on the image
+        img_with_markers = img.copy()
+        cv2.circle(img_with_markers, (p1_x, p1_y), 5, (255, 0, 0), -1)  # P1
+        cv2.circle(img_with_markers, (p2_x, p2_y), 5, (0, 255, 0), -1)  # P2
+        cv2.line(img_with_markers, (p1_x, p1_y), (p2_x, p2_y), (0, 0, 255), 2)  # Line between P1 and P2
+        
+        st.image(img_with_markers, caption=f"Image {selected_image_idx+1} with Points P1 (red), P2 (green), and Distance Line (blue)", use_column_width=True)
+        
+        # Compute distance between P1 and P2
+        distance_pixels = np.sqrt((p2_x - p1_x)**2 + (p2_y - p1_y)**2)
+        st.write(f"Distance between P1 ({p1_x}, {p1_y}) and P2 ({p2_x}, {p2_y}) (pixels): {distance_pixels:.2f}")
+        
         if selected_image_idx in scale_factors:
             distance_nm = distance_pixels * scale_factor
-            st.write(f"Distance from Bottom-Left (nm): {distance_nm:.2f}")
+            st.write(f"Distance between P1 and P2 (nm): {distance_nm:.2f}")
 
     # Segmentation parameters
     st.subheader("Segmentation Parameters")
@@ -108,22 +140,21 @@ if uploaded_files:
 
             st.write(f"Processing Image {idx+1}...")
             scale_factor = scale_factors[idx]
-            x1, y1 = scale_bar_coords[idx][0]
-            y1_bottom = height - 1 - y1  # Convert to bottom-based Y
-            x2, y2 = scale_bar_coords[idx][1]
-            y2_bottom = height - 1 - y2  # Convert to bottom-based Y
+            s1_x, s1_y = scale_bar_coords[idx][0]
+            s2_x, s2_y = scale_bar_coords[idx][1]
             height, width = img.shape[:2]
 
-            # Calculate corner coordinates in nm (bottom-left as 0,0)
-            top_left_nm = (0, (height - 1) * scale_factor)
-            top_right_nm = (width * scale_factor, (height - 1) * scale_factor)
-            bottom_right_nm = (width * scale_factor, 0)
+            # Calculate corner coordinates in nm (top-left as 0,0)
+            top_left_nm = (0, 0)
+            top_right_nm = (width * scale_factor, 0)
+            bottom_right_nm = (width * scale_factor, height * scale_factor)
+            bottom_left_nm = (0, height * scale_factor)
 
             st.write(f"Coordinate System (nm) for Image {idx+1}:")
-            st.write(f"Bottom-Left: (0, 0)")
             st.write(f"Top-Left: ({top_left_nm[0]:.2f}, {top_left_nm[1]:.2f})")
             st.write(f"Top-Right: ({top_right_nm[0]:.2f}, {top_right_nm[1]:.2f})")
             st.write(f"Bottom-Right: ({bottom_right_nm[0]:.2f}, {bottom_right_nm[1]:.2f})")
+            st.write(f"Bottom-Left: ({bottom_left_nm[0]:.2f}, {bottom_left_nm[1]:.2f})")
 
             # Convert to HSV for better color segmentation
             hsv_img = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
@@ -162,9 +193,7 @@ if uploaded_files:
                     for green_cnt in green_contours:
                         if cv2.contourArea(green_cnt) > min_particle_area:
                             (x_shell, y_shell), shell_radius_pixels = cv2.minEnclosingCircle(green_cnt)
-                            y_bottom = height - 1 - y  # Convert to bottom-based Y for comparison
-                            y_shell_bottom = height - 1 - y_shell  # Convert to bottom-based Y for comparison
-                            if abs(x - x_shell) < 10 and abs(y_bottom - y_shell_bottom) < 10 and shell_radius_pixels > core_radius_pixels:
+                            if abs(x - x_shell) < 10 and abs(y - y_shell) < 10 and shell_radius_pixels > core_radius_pixels:
                                 shell_radius_nm = shell_radius_pixels * scale_factor
                                 shell_thickness_nm = (shell_radius_pixels - core_radius_pixels) * scale_factor
                                 shell_radii.append(shell_radius_nm)
