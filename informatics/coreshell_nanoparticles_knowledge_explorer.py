@@ -16,6 +16,7 @@ from collections import Counter
 import numpy as np
 from tenacity import retry, stop_after_attempt, wait_fixed
 import zipfile
+import hashlib
 
 # Define database directory and files
 DB_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,14 +41,19 @@ st.sidebar.markdown("""
 - Install: `pip install arxiv pymupdf pandas streamlit transformers torch scipy numpy tenacity`
 """)
 
-# Load SciBERT model and tokenizer
-try:
-    scibert_tokenizer = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
-    scibert_model = AutoModelForSequenceClassification.from_pretrained("allenai/scibert_scivocab_uncased")
-    scibert_model.eval()
-except Exception as e:
-    st.error(f"Failed to load SciBERT: {e}. Install: `pip install transformers torch`")
-    st.stop()
+# Load SciBERT model and tokenizer - cache this expensive operation
+@st.cache_resource
+def load_scibert_model():
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
+        model = AutoModelForSequenceClassification.from_pretrained("allenai/scibert_scivocab_uncased")
+        model.eval()
+        return tokenizer, model
+    except Exception as e:
+        st.error(f"Failed to load SciBERT: {e}. Install: `pip install transformers torch`")
+        st.stop()
+
+scibert_tokenizer, scibert_model = load_scibert_model()
 
 # Create PDFs directory
 pdf_dir = os.path.join(DB_DIR, "pdfs")
@@ -55,9 +61,18 @@ if not os.path.exists(pdf_dir):
     os.makedirs(pdf_dir)
     st.info(f"Created directory: {pdf_dir}")
 
-# Initialize session state for logs
+# Initialize session state for persistent data
 if "log_buffer" not in st.session_state:
     st.session_state.log_buffer = []
+
+if "processed_papers" not in st.session_state:
+    st.session_state.processed_papers = None
+
+if "search_params_hash" not in st.session_state:
+    st.session_state.search_params_hash = None
+
+if "pdf_paths" not in st.session_state:
+    st.session_state.pdf_paths = []
 
 def update_log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -210,9 +225,13 @@ def save_to_sqlite(papers_df, params_list, metadata_db_file=METADATA_DB_FILE):
         update_log(f"SQLite save failed: {str(e)}")
         return f"Failed to save to SQLite: {str(e)}"
 
-# Query arXiv
-@st.cache_data
-def query_arxiv(query, categories, max_results, start_year, end_year):
+# Query arXiv with caching based on search parameters
+@st.cache_data(show_spinner=False)
+def query_arxiv_cached(_query, _categories, _max_results, _start_year, _end_year):
+    """Cached version of arXiv query to avoid re-running identical searches"""
+    return _perform_arxiv_query(_query, _categories, _max_results, _start_year, _end_year)
+
+def _perform_arxiv_query(query, categories, max_results, start_year, end_year):
     try:
         query_terms = query.strip().split()
         formatted_terms = [term.strip('"').replace(" ", "+") for term in query_terms]
@@ -264,9 +283,14 @@ def query_arxiv(query, categories, max_results, start_year, end_year):
         st.error(f"Error querying arXiv: {str(e)}. Try simplifying the query.")
         return []
 
-# Download PDF and extract text
+# Download PDF and extract text with caching
+@st.cache_data
+def download_pdf_and_extract_cached(_pdf_url, _paper_id, _paper_metadata):
+    """Cached PDF download to avoid re-downloading the same files"""
+    return _download_pdf_and_extract(_pdf_url, _paper_id, _paper_metadata)
+
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
+def _download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
     pdf_path = os.path.join(pdf_dir, f"{paper_id}.pdf")
     try:
         urllib.request.urlretrieve(pdf_url, pdf_path)
@@ -290,14 +314,52 @@ def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
         update_log(f"PDF download failed for {paper_id}: {str(e)}")
         return f"Failed: {str(e)}", None, f"Error: {str(e)}"
 
-# Create ZIP file of PDFs
-def create_pdf_zip(pdf_paths):
+# Create ZIP file of PDFs with caching
+@st.cache_data
+def create_pdf_zip_cached(_pdf_paths):
+    """Cached ZIP creation to avoid re-zipping the same files"""
+    return _create_pdf_zip(_pdf_paths)
+
+def _create_pdf_zip(pdf_paths):
     zip_path = os.path.join(DB_DIR, "coreshellnanoparticles_pdfs.zip")
     with zipfile.ZipFile(zip_path, 'w') as zipf:
         for pdf_path in pdf_paths:
             if pdf_path and os.path.exists(pdf_path):
                 zipf.write(pdf_path, os.path.basename(pdf_path))
     return zip_path
+
+def create_search_hash(query, categories, max_results, start_year, end_year):
+    """Create a hash of search parameters to identify identical searches"""
+    params_str = f"{query}_{'_'.join(sorted(categories))}_{max_results}_{start_year}_{end_year}"
+    return hashlib.md5(params_str.encode()).hexdigest()
+
+def process_search_results(papers):
+    """Process search results and cache them in session state"""
+    if not papers:
+        return [], []
+    
+    relevant_papers = [p for p in papers if p["relevance_prob"] > 30.0]
+    if not relevant_papers:
+        return [], []
+    
+    pdf_paths = []
+    progress_bar = st.progress(0)
+    
+    for i, paper in enumerate(relevant_papers):
+        if paper["pdf_url"] and paper["download_status"] == "Not downloaded":
+            status, pdf_path, content = download_pdf_and_extract_cached(
+                paper["pdf_url"], paper["id"], paper
+            )
+            paper["download_status"] = status
+            paper["pdf_path"] = pdf_path
+            paper["content"] = content
+            if pdf_path:
+                pdf_paths.append(pdf_path)
+        progress_bar.progress((i + 1) / len(relevant_papers))
+        time.sleep(1)  # Avoid rate-limiting
+        update_log(f"Processed paper {i+1}/{len(relevant_papers)}: {paper['title']}")
+    
+    return relevant_papers, pdf_paths
 
 # Main Streamlit app
 st.header("arXiv Query for Ag Cu Core-Shell Nanoparticles")
@@ -322,6 +384,9 @@ with st.sidebar:
     output_formats = st.multiselect("Output Formats", ["SQLite (.db)", "CSV", "JSON"], default=["SQLite (.db)"])
     search_button = st.button("Search arXiv")
 
+# Check if we have cached results for the current search
+current_hash = create_search_hash(query, categories, max_results, start_year, end_year)
+
 if search_button:
     if not query.strip():
         st.error("Enter a valid query.")
@@ -331,80 +396,88 @@ if search_button:
         st.error("Start year must be ≤ end year.")
     else:
         with st.spinner("Querying arXiv..."):
-            papers = query_arxiv(query, categories, max_results, start_year, end_year)
+            papers = query_arxiv_cached(query, categories, max_results, start_year, end_year)
         
         if not papers:
             st.warning("No papers found. Broaden query or categories.")
         else:
-            st.success(f"Found **{len(papers)}** papers. Filtering for relevance > 30%...")
-            relevant_papers = [p for p in papers if p["relevance_prob"] > 30.0]
+            st.session_state.search_params_hash = current_hash
+            relevant_papers, pdf_paths = process_search_results(papers)
+            st.session_state.processed_papers = relevant_papers
+            st.session_state.pdf_paths = pdf_paths
+            
             if not relevant_papers:
                 st.warning("No papers with relevance > 30%. Broaden query or check 'coreshellnanoparticles_query.log'.")
             else:
                 st.success(f"**{len(relevant_papers)}** papers with relevance > 30%. Downloading PDFs...")
-                progress_bar = st.progress(0)
-                pdf_paths = []
-                for i, paper in enumerate(relevant_papers):
-                    if paper["pdf_url"]:
-                        status, pdf_path, content = download_pdf_and_extract(paper["pdf_url"], paper["id"], paper)
-                        paper["download_status"] = status
-                        paper["pdf_path"] = pdf_path
-                        paper["content"] = content
-                        if pdf_path:
-                            pdf_paths.append(pdf_path)
-                    progress_bar.progress((i + 1) / len(relevant_papers))
-                    time.sleep(1)  # Avoid rate-limiting
-                    update_log(f"Processed paper {i+1}/{len(relevant_papers)}: {paper['title']}")
-                
-                df = pd.DataFrame(relevant_papers)
-                st.subheader("Papers (Relevance > 30%)")
-                st.dataframe(
-                    df[["id", "title", "year", "categories", "abstract_highlighted", "matched_terms", "relevance_prob", "download_status"]],
-                    use_container_width=True
+                display_results_and_downloads(relevant_papers, pdf_paths, output_formats)
+
+# If we have cached results and the search parameters haven't changed, show them without re-processing
+elif (st.session_state.processed_papers is not None and 
+      st.session_state.search_params_hash == current_hash):
+    
+    st.info("Showing cached results from previous search. Modify parameters and click 'Search arXiv' to run a new search.")
+    display_results_and_downloads(
+        st.session_state.processed_papers, 
+        st.session_state.pdf_paths, 
+        output_formats
+    )
+
+def display_results_and_downloads(relevant_papers, pdf_paths, output_formats):
+    """Display results and download options using cached data"""
+    df = pd.DataFrame(relevant_papers)
+    st.subheader("Papers (Relevance > 30%)")
+    st.dataframe(
+        df[["id", "title", "year", "categories", "abstract_highlighted", "matched_terms", "relevance_prob", "download_status"]],
+        use_container_width=True
+    )
+    
+    if "SQLite (.db)" in output_formats:
+        sqlite_status = save_to_sqlite(df.drop(columns=["abstract_highlighted"]), [])
+        st.info(sqlite_status)
+    
+    if "CSV" in output_formats:
+        csv = df.drop(columns=["abstract_highlighted"]).to_csv(index=False)
+        st.download_button(
+            label="Download Paper Metadata CSV",
+            data=csv,
+            file_name="coreshellnanoparticles_papers.csv",
+            mime="text/csv"
+        )
+    
+    if "JSON" in output_formats:
+        json_data = df.drop(columns=["abstract_highlighted"]).to_json(orient="records", lines=True)
+        st.download_button(
+            label="Download Paper Metadata JSON",
+            data=json_data,
+            file_name="coreshellnanoparticles_papers.json",
+            mime="application/json"
+        )
+    
+    # Display individual PDF links
+    if pdf_paths:
+        st.subheader("Individual PDF Downloads")
+        for pdf_path in pdf_paths:
+            with open(pdf_path, "rb") as f:
+                st.download_button(
+                    label=f"Download {os.path.basename(pdf_path)}",
+                    data=f,
+                    file_name=os.path.basename(pdf_path),
+                    mime="application/pdf"
                 )
-                
-                if "SQLite (.db)" in output_formats:
-                    sqlite_status = save_to_sqlite(df.drop(columns=["abstract_highlighted"]), [])
-                    st.info(sqlite_status)
-                
-                if "CSV" in output_formats:
-                    csv = df.drop(columns=["abstract_highlighted"]).to_csv(index=False)
-                    st.download_button(
-                        label="Download Paper Metadata CSV",
-                        data=csv,
-                        file_name="coreshellnanoparticles_papers.csv",
-                        mime="text/csv"
-                    )
-                
-                if "JSON" in output_formats:
-                    json_data = df.drop(columns=["abstract_highlighted"]).to_json(orient="records", lines=True)
-                    st.download_button(
-                        label="Download Paper Metadata JSON",
-                        data=json_data,
-                        file_name="coreshellnanoparticles_papers.json",
-                        mime="application/json"
-                    )
-                
-                # Display individual PDF links
-                if pdf_paths:
-                    st.subheader("Individual PDF Downloads")
-                    for pdf_path in pdf_paths:
-                        with open(pdf_path, "rb") as f:
-                            st.download_button(
-                                label=f"Download {os.path.basename(pdf_path)}",
-                                data=f,
-                                file_name=os.path.basename(pdf_path),
-                                mime="application/pdf"
-                            )
-                    
-                    # ZIP download
-                    zip_path = create_pdf_zip(pdf_paths)
-                    with open(zip_path, "rb") as f:
-                        st.download_button(
-                            label="Download All PDFs as ZIP",
-                            data=f,
-                            file_name="coreshellnanoparticles_pdfs.zip",
-                            mime="application/zip"
-                        )
-                
-                display_logs()
+        
+        # ZIP download - use cached version
+        zip_path = create_pdf_zip_cached(pdf_paths)
+        with open(zip_path, "rb") as f:
+            st.download_button(
+                label="Download All PDFs as ZIP",
+                data=f,
+                file_name="coreshellnanoparticles_pdfs.zip",
+                mime="application/zip"
+            )
+    
+    display_logs()
+
+# Always show logs if they exist
+if st.session_state.log_buffer:
+    display_logs()
