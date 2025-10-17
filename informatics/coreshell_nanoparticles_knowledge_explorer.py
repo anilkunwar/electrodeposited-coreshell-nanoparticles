@@ -55,9 +55,13 @@ if not os.path.exists(pdf_dir):
     os.makedirs(pdf_dir)
     st.info(f"Created directory: {pdf_dir}")
 
-# Initialize session state for logs
+# Initialize session state for logs and data persistence
 if "log_buffer" not in st.session_state:
     st.session_state.log_buffer = []
+if "relevant_papers" not in st.session_state:
+    st.session_state.relevant_papers = None
+if "pdf_paths" not in st.session_state:
+    st.session_state.pdf_paths = []
 
 def update_log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -106,6 +110,7 @@ def score_abstract_with_scibert(abstract):
         return relevance_prob
 
 # Extract text from PDF
+@st.cache_data
 def extract_text_from_pdf(pdf_path):
     try:
         doc = fitz.open(pdf_path)
@@ -195,6 +200,7 @@ def create_universe_db(paper, db_file=UNIVERSE_DB_FILE):
         raise
 
 # Save to SQLite
+@st.cache_data
 def save_to_sqlite(papers_df, params_list, metadata_db_file=METADATA_DB_FILE):
     try:
         initialize_db(metadata_db_file)
@@ -291,6 +297,7 @@ def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
         return f"Failed: {str(e)}", None, f"Error: {str(e)}"
 
 # Create ZIP file of PDFs
+@st.cache_data
 def create_pdf_zip(pdf_paths):
     zip_path = os.path.join(DB_DIR, "coreshellnanoparticles_pdfs.zip")
     with zipfile.ZipFile(zip_path, 'w') as zipf:
@@ -345,66 +352,90 @@ if search_button:
                 progress_bar = st.progress(0)
                 pdf_paths = []
                 for i, paper in enumerate(relevant_papers):
-                    if paper["pdf_url"]:
-                        status, pdf_path, content = download_pdf_and_extract(paper["pdf_url"], paper["id"], paper)
-                        paper["download_status"] = status
-                        paper["pdf_path"] = pdf_path
-                        paper["content"] = content
-                        if pdf_path:
-                            pdf_paths.append(pdf_path)
+                    pdf_path = os.path.join(pdf_dir, f"{paper['id']}.pdf")
+                    paper["pdf_path"] = pdf_path
+                    if os.path.exists(pdf_path):
+                        status = "Already downloaded"
+                        file_size = os.path.getsize(pdf_path) / 1024
+                        status = f"{status} ({file_size:.2f} KB)"
+                        content = extract_text_from_pdf(pdf_path)
+                        if not content.startswith("Error"):
+                            paper_data = {
+                                "id": paper['id'],
+                                "title": paper.get("title", ""),
+                                "authors": paper.get("authors", "Unknown"),
+                                "year": paper.get("year", 0),
+                                "content": content
+                            }
+                            create_universe_db(paper_data)
+                    else:
+                        if paper["pdf_url"]:
+                            status, pdf_path, content = download_pdf_and_extract(paper["pdf_url"], paper["id"], paper)
+                            paper["pdf_path"] = pdf_path
+                    paper["download_status"] = status
+                    paper["content"] = content
+                    if pdf_path and os.path.exists(pdf_path):
+                        pdf_paths.append(pdf_path)
                     progress_bar.progress((i + 1) / len(relevant_papers))
                     time.sleep(1)  # Avoid rate-limiting
                     update_log(f"Processed paper {i+1}/{len(relevant_papers)}: {paper['title']}")
                 
-                df = pd.DataFrame(relevant_papers)
-                st.subheader("Papers (Relevance > 30%)")
-                st.dataframe(
-                    df[["id", "title", "year", "categories", "abstract_highlighted", "matched_terms", "relevance_prob", "download_status"]],
-                    use_container_width=True
+                st.session_state.relevant_papers = relevant_papers
+                st.session_state.pdf_paths = pdf_paths
+
+# Display results if available in session state
+if st.session_state.relevant_papers:
+    relevant_papers = st.session_state.relevant_papers
+    pdf_paths = st.session_state.pdf_paths
+    df = pd.DataFrame(relevant_papers)
+    st.subheader("Papers (Relevance > 30%)")
+    st.dataframe(
+        df[["id", "title", "year", "categories", "abstract_highlighted", "matched_terms", "relevance_prob", "download_status"]],
+        use_container_width=True
+    )
+    
+    if "SQLite (.db)" in output_formats:
+        sqlite_status = save_to_sqlite(df.drop(columns=["abstract_highlighted"]), [])
+        st.info(sqlite_status)
+    
+    if "CSV" in output_formats:
+        csv = df.drop(columns=["abstract_highlighted"]).to_csv(index=False)
+        st.download_button(
+            label="Download Paper Metadata CSV",
+            data=csv,
+            file_name="coreshellnanoparticles_papers.csv",
+            mime="text/csv"
+        )
+    
+    if "JSON" in output_formats:
+        json_data = df.drop(columns=["abstract_highlighted"]).to_json(orient="records", lines=True)
+        st.download_button(
+            label="Download Paper Metadata JSON",
+            data=json_data,
+            file_name="coreshellnanoparticles_papers.json",
+            mime="application/json"
+        )
+    
+    # Display individual PDF links
+    if pdf_paths:
+        st.subheader("Individual PDF Downloads")
+        for pdf_path in pdf_paths:
+            with open(pdf_path, "rb") as f:
+                st.download_button(
+                    label=f"Download {os.path.basename(pdf_path)}",
+                    data=f,
+                    file_name=os.path.basename(pdf_path),
+                    mime="application/pdf"
                 )
-                
-                if "SQLite (.db)" in output_formats:
-                    sqlite_status = save_to_sqlite(df.drop(columns=["abstract_highlighted"]), [])
-                    st.info(sqlite_status)
-                
-                if "CSV" in output_formats:
-                    csv = df.drop(columns=["abstract_highlighted"]).to_csv(index=False)
-                    st.download_button(
-                        label="Download Paper Metadata CSV",
-                        data=csv,
-                        file_name="coreshellnanoparticles_papers.csv",
-                        mime="text/csv"
-                    )
-                
-                if "JSON" in output_formats:
-                    json_data = df.drop(columns=["abstract_highlighted"]).to_json(orient="records", lines=True)
-                    st.download_button(
-                        label="Download Paper Metadata JSON",
-                        data=json_data,
-                        file_name="coreshellnanoparticles_papers.json",
-                        mime="application/json"
-                    )
-                
-                # Display individual PDF links
-                if pdf_paths:
-                    st.subheader("Individual PDF Downloads")
-                    for pdf_path in pdf_paths:
-                        with open(pdf_path, "rb") as f:
-                            st.download_button(
-                                label=f"Download {os.path.basename(pdf_path)}",
-                                data=f,
-                                file_name=os.path.basename(pdf_path),
-                                mime="application/pdf"
-                            )
-                    
-                    # ZIP download
-                    zip_path = create_pdf_zip(pdf_paths)
-                    with open(zip_path, "rb") as f:
-                        st.download_button(
-                            label="Download All PDFs as ZIP",
-                            data=f,
-                            file_name="coreshellnanoparticles_pdfs.zip",
-                            mime="application/zip"
-                        )
-                
-                display_logs()
+        
+        # ZIP download
+        zip_path = create_pdf_zip(tuple(pdf_paths))  # Use tuple for caching
+        with open(zip_path, "rb") as f:
+            st.download_button(
+                label="Download All PDFs as ZIP",
+                data=f,
+                file_name="coreshellnanoparticles_pdfs.zip",
+                mime="application/zip"
+            )
+    
+    display_logs()
