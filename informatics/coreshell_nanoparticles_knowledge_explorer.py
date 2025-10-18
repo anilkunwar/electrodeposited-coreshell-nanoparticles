@@ -392,7 +392,7 @@ def query_arxiv(query, categories, max_results, start_year, end_year):
                 abstract = result.summary.lower()
                 title = result.title.lower()
                 query_words = set(word.lower().strip('"') for word in query_terms)
-                matched_terms = [word for word in query_words if word in abstract or in title]
+                matched_terms = [word for word in query_words if word in abstract or word in title]
                 if not matched_terms:
                     continue
                 relevance_prob = score_abstract_with_scibert(result.summary)
