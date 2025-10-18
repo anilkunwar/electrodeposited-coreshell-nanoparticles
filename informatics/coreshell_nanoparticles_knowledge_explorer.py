@@ -55,6 +55,17 @@ if not os.path.exists(pdf_dir):
     os.makedirs(pdf_dir)
     st.info(f"Created directory: {pdf_dir}")
 
+# Initialize session state for logs
+if "log_buffer" not in st.session_state:
+    st.session_state.log_buffer = []
+
+def update_log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.log_buffer.append(f"[{timestamp}] {message}")
+    if len(st.session_state.log_buffer) > 30:
+        st.session_state.log_buffer.pop(0)
+    logging.info(message)
+
 # Initialize databases
 def initialize_db(db_file):
     try:
@@ -111,17 +122,6 @@ def initialize_db(db_file):
 
 initialize_db(METADATA_DB_FILE)
 initialize_db(UNIVERSE_DB_FILE)
-
-# Initialize session state for logs
-if "log_buffer" not in st.session_state:
-    st.session_state.log_buffer = []
-
-def update_log(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state.log_buffer.append(f"[{timestamp}] {message}")
-    if len(st.session_state.log_buffer) > 30:
-        st.session_state.log_buffer.pop(0)
-    logging.info(message)
 
 # Define key terms related to core-shell nanoparticles
 KEY_TERMS = [
