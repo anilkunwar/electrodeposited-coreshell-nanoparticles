@@ -24,7 +24,6 @@ from urllib3.util.retry import Retry
 import tempfile
 
 # ===== CLOUD-OPTIMIZED CONFIGURATION =====
-# Use temporary directory for cloud environments
 if os.path.exists("/tmp"):  # Cloud environments typically have /tmp
     DB_DIR = "/tmp"
 else:
@@ -121,10 +120,24 @@ if "processing" not in st.session_state:
     st.session_state.processing = False
 if "current_progress" not in st.session_state:
     st.session_state.current_progress = 0
+if "download_files" not in st.session_state:
+    st.session_state.download_files = {"pdf_paths": [], "zip_path": None}
+if "download_triggered" not in st.session_state:
+    st.session_state.download_triggered = False
 
 def reset_processing():
+    """Reset processing state"""
     st.session_state.processing = False
     st.session_state.current_progress = 0
+    st.session_state.download_triggered = False
+
+def reset_downloads():
+    """Reset download-related state and clear cache"""
+    st.session_state.download_files = {"pdf_paths": [], "zip_path": None}
+    st.session_state.download_triggered = False
+    query_arxiv.clear()  # Clear the arXiv query cache
+    cleanup_memory()
+    update_log("Download state and cache cleared")
 
 def update_log(message):
     """Update log with timestamp"""
@@ -371,7 +384,7 @@ def save_to_sqlite(papers_df, params_list, metadata_db_file=METADATA_DB_FILE):
         return f"Failed to save to SQLite: {str(e)}"
 
 # ===== ARXIV QUERY =====
-@st.cache_data(ttl=3600)  # Cache for 1 hour
+@st.cache_data(ttl=3600)
 def query_arxiv(query, categories, max_results, start_year, end_year):
     """Query arXiv for papers"""
     try:
@@ -460,16 +473,32 @@ def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
     except Exception as e:
         update_log(f"PDF download failed for {paper_id}: {str(e)}")
         return f"Failed: {str(e)}", None, f"Error: {str(e)}"
+    finally:
+        session.close()  # Ensure session is closed
 
 # ===== FILE MANAGEMENT =====
 def create_pdf_zip(pdf_paths):
     """Create ZIP file of PDFs"""
     zip_path = os.path.join(DB_DIR, "coreshellnanoparticles_pdfs.zip")
-    with zipfile.ZipFile(zip_path, 'w') as zipf:
-        for pdf_path in pdf_paths:
-            if pdf_path and os.path.exists(pdf_path):
-                zipf.write(pdf_path, os.path.basename(pdf_path))
-    return zip_path
+    try:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for pdf_path in pdf_paths:
+                if pdf_path and os.path.exists(pdf_path):
+                    zipf.write(pdf_path, os.path.basename(pdf_path))
+        update_log(f"Created ZIP file at {zip_path}")
+        return zip_path
+    except Exception as e:
+        update_log(f"Failed to create ZIP file: {str(e)}")
+        return None
+
+def read_file_for_download(file_path):
+    """Read file for download and ensure handle is closed"""
+    try:
+        with open(file_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        update_log(f"Failed to read file {file_path} for download: {str(e)}")
+        return None
 
 # ===== STREAMLIT UI =====
 st.header("arXiv Query for Ag Cu Core-Shell Nanoparticles")
@@ -486,7 +515,7 @@ with st.sidebar:
     query = st.text_input("Query", value=' OR '.join([f'"{term}"' for term in KEY_TERMS]))
     default_categories = ["cond-mat.mtrl-sci", "physics.app-ph", "physics.chem-ph"]
     categories = st.multiselect("Categories", default_categories, default=default_categories)
-    max_results = st.slider("Max Papers", min_value=1, max_value=100, value=20)  # Reduced for cloud
+    max_results = st.slider("Max Papers", min_value=1, max_value=100, value=20)
     current_year = datetime.now().year
     col1, col2 = st.columns(2)
     with col1:
@@ -502,6 +531,12 @@ with st.sidebar:
     
     search_button = st.button("Search arXiv")
     convert_button = st.button("Update DBs from Existing PDFs")
+    reset_downloads_button = st.button("Reset Downloads")
+
+# Reset downloads if button clicked
+if reset_downloads_button:
+    reset_downloads()
+    st.success("Download state reset. You can now perform a new search or download.")
 
 # Main processing
 if convert_button:
@@ -528,6 +563,7 @@ if search_button:
         st.error("Start year must be ≤ end year.")
     else:
         st.session_state.processing = True
+        st.session_state.download_files = {"pdf_paths": [], "zip_path": None}
         
         try:
             # Perform health check
@@ -580,6 +616,9 @@ if search_button:
                     status_text.empty()
                     progress_bar.empty()
                     
+                    # Store PDF paths in session state
+                    st.session_state.download_files["pdf_paths"] = pdf_paths
+                    
                     # Display results
                     df = pd.DataFrame(relevant_papers)
                     st.subheader("Papers (Relevance > 30%)")
@@ -599,7 +638,8 @@ if search_button:
                             label="Download Paper Metadata CSV",
                             data=csv,
                             file_name="coreshellnanoparticles_papers.csv",
-                            mime="text/csv"
+                            mime="text/csv",
+                            key="csv_download"
                         )
                     
                     if "JSON" in output_formats:
@@ -607,52 +647,63 @@ if search_button:
                         st.download_button(
                             label="Download Paper Metadata JSON",
                             data=json_data,
-                            file_name="coreshellnanoparticles_papers.json",
-                            mime="application/json"
+                            file_name="coreshellnanoparticles_pdfs.json",
+                            mime="application/json",
+                            key="json_download"
                         )
                     
                     # Display individual PDF links
                     if pdf_paths:
                         st.subheader("Individual PDF Downloads")
-                        for pdf_path in pdf_paths:
-                            with open(pdf_path, "rb") as f:
+                        for idx, pdf_path in enumerate(pdf_paths):
+                            file_data = read_file_for_download(pdf_path)
+                            if file_data:
                                 st.download_button(
                                     label=f"Download {os.path.basename(pdf_path)}",
-                                    data=f,
+                                    data=file_data,
                                     file_name=os.path.basename(pdf_path),
-                                    mime="application/pdf"
+                                    mime="application/pdf",
+                                    key=f"pdf_download_{idx}"
                                 )
                         
                         # ZIP download
                         zip_path = create_pdf_zip(pdf_paths)
-                        with open(zip_path, "rb") as f:
-                            st.download_button(
-                                label="Download All PDFs as ZIP",
-                                data=f,
-                                file_name="coreshellnanoparticles_pdfs.zip",
-                                mime="application/zip"
-                            )
+                        if zip_path:
+                            st.session_state.download_files["zip_path"] = zip_path
+                            file_data = read_file_for_download(zip_path)
+                            if file_data:
+                                st.download_button(
+                                    label="Download All PDFs as ZIP",
+                                    data=file_data,
+                                    file_name="coreshellnanoparticles_pdfs.zip",
+                                    mime="application/zip",
+                                    key="zip_download"
+                                )
                     
                     # Database file downloads
                     st.subheader("Database Downloads")
                     if os.path.exists(METADATA_DB_FILE):
-                        with open(METADATA_DB_FILE, "rb") as f:
+                        file_data = read_file_for_download(METADATA_DB_FILE)
+                        if file_data:
                             st.download_button(
                                 label="Download Metadata Database",
-                                data=f,
+                                data=file_data,
                                 file_name="coreshellnanoparticles_metadata.db",
-                                mime="application/octet-stream"
+                                mime="application/octet-stream",
+                                key="metadata_db_download"
                             )
                     else:
                         st.warning(f"Metadata database ({METADATA_DB_FILE}) not found.")
                     
                     if os.path.exists(UNIVERSE_DB_FILE):
-                        with open(UNIVERSE_DB_FILE, "rb") as f:
+                        file_data = read_file_for_download(UNIVERSE_DB_FILE)
+                        if file_data:
                             st.download_button(
                                 label="Download Universe Database",
-                                data=f,
+                                data=file_data,
                                 file_name="coreshellnanoparticles_universe.db",
-                                mime="application/octet-stream"
+                                mime="application/octet-stream",
+                                key="universe_db_download"
                             )
                     else:
                         st.warning(f"Universe database ({UNIVERSE_DB_FILE}) not found.")
