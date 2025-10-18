@@ -220,9 +220,9 @@ def save_to_sqlite(papers_df, params_list, metadata_db_file=METADATA_DB_FILE):
 @st.cache_data
 def query_arxiv(query, categories, max_results, start_year, end_year):
     try:
-        query_terms = query.strip().split()
-        formatted_terms = [term.strip('"').replace(" ", "+") for term in query_terms]
-        api_query = " ".join(formatted_terms)
+        query_terms = re.findall(r'"(.*?)"', query)
+        formatted_terms = [term.replace(" ", "+") for term in query_terms]
+        api_query = " OR ".join(formatted_terms)
         
         client = arxiv.Client()
         search = arxiv.Search(
@@ -236,7 +236,7 @@ def query_arxiv(query, categories, max_results, start_year, end_year):
             if any(cat in result.categories for cat in categories) and start_year <= result.published.year <= end_year:
                 abstract = result.summary.lower()
                 title = result.title.lower()
-                query_words = set(word.lower().strip('"') for word in query_terms)
+                query_words = set(term.lower() for term in query_terms)
                 matched_terms = [word for word in query_words if word in abstract or word in title]
                 if not matched_terms:
                     continue
