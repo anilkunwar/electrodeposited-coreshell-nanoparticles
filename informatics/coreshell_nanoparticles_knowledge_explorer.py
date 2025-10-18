@@ -55,6 +55,63 @@ if not os.path.exists(pdf_dir):
     os.makedirs(pdf_dir)
     st.info(f"Created directory: {pdf_dir}")
 
+# Initialize databases
+def initialize_db(db_file):
+    try:
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        if 'universe' in db_file:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS papers (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    authors TEXT,
+                    year INTEGER,
+                    content TEXT
+                )
+            """)
+        else:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS papers (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    authors TEXT,
+                    year INTEGER,
+                    categories TEXT,
+                    abstract TEXT,
+                    pdf_url TEXT,
+                    download_status TEXT,
+                    matched_terms TEXT,
+                    relevance_prob REAL,
+                    pdf_path TEXT,
+                    content TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS parameters (
+                    paper_id TEXT,
+                    entity_text TEXT,
+                    entity_label TEXT,
+                    value REAL,
+                    unit TEXT,
+                    context TEXT,
+                    phase TEXT,
+                    score REAL,
+                    co_occurrence BOOLEAN,
+                    FOREIGN KEY (paper_id) REFERENCES papers(id)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_paper_id ON parameters(paper_id)")
+        conn.commit()
+        conn.close()
+        update_log(f"Initialized database schema for {db_file}")
+    except Exception as e:
+        update_log(f"Failed to initialize {db_file}: {str(e)}")
+        st.error(f"Failed to initialize {db_file}: {str(e)}")
+
+initialize_db(METADATA_DB_FILE)
+initialize_db(UNIVERSE_DB_FILE)
+
 # Initialize session state for logs
 if "log_buffer" not in st.session_state:
     st.session_state.log_buffer = []
@@ -118,48 +175,46 @@ def extract_text_from_pdf(pdf_path):
         update_log(f"PDF extraction failed for {pdf_path}: {str(e)}")
         return f"Error: {str(e)}"
 
-# Initialize database
-def initialize_db(db_file):
+# Update content in DB
+def update_db_content(db_file, paper_id, content):
     try:
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS papers (
-                id TEXT PRIMARY KEY,
-                title TEXT,
-                authors TEXT,
-                year INTEGER,
-                categories TEXT,
-                abstract TEXT,
-                pdf_url TEXT,
-                download_status TEXT,
-                matched_terms TEXT,
-                relevance_prob REAL,
-                pdf_path TEXT,
-                content TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS parameters (
-                paper_id TEXT,
-                entity_text TEXT,
-                entity_label TEXT,
-                value REAL,
-                unit TEXT,
-                context TEXT,
-                phase TEXT,
-                score REAL,
-                co_occurrence BOOLEAN,
-                FOREIGN KEY (paper_id) REFERENCES papers(id)
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_paper_id ON parameters(paper_id)")
+        cursor.execute("UPDATE papers SET content = ? WHERE id = ?", (content, paper_id))
+        if cursor.rowcount == 0:
+            if 'universe' in db_file:
+                cursor.execute("""
+                    INSERT INTO papers (id, title, authors, year, content)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (paper_id, "Unknown", "Unknown", 0, content))
+                update_log(f"Inserted placeholder for {paper_id} in {db_file}")
+            else:
+                update_log(f"Skipped inserting {paper_id} in {db_file} as metadata not present")
+        else:
+            update_log(f"Updated content for {paper_id} in {db_file}")
         conn.commit()
         conn.close()
-        update_log(f"Initialized database schema for {db_file}")
     except Exception as e:
-        update_log(f"Failed to initialize {db_file}: {str(e)}")
-        st.error(f"Failed to initialize {db_file}: {str(e)}")
+        update_log(f"Failed to update content in {db_file} for {paper_id}: {str(e)}")
+
+# Batch convert existing PDFs to DBs
+def batch_convert_pdfs():
+    pdf_files = [f for f in os.listdir(pdf_dir) if f.endswith('.pdf')]
+    if not pdf_files:
+        update_log("No PDFs found in directory.")
+        return
+    progress_bar = st.progress(0)
+    for i, filename in enumerate(pdf_files):
+        pdf_path = os.path.join(pdf_dir, filename)
+        paper_id = filename[:-4]
+        text = extract_text_from_pdf(pdf_path)
+        if not text.startswith("Error"):
+            update_db_content(METADATA_DB_FILE, paper_id, text)
+            update_db_content(UNIVERSE_DB_FILE, paper_id, text)
+        else:
+            update_log(text)
+        progress_bar.progress((i + 1) / len(pdf_files))
+        time.sleep(0.1)  # Small delay to avoid overwhelming
 
 # Create coreshellnanoparticles_universe.db incrementally
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
@@ -281,6 +336,7 @@ def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
                 "content": text
             }
             create_universe_db(paper_data)
+            update_db_content(METADATA_DB_FILE, paper_id, text)  # Also update metadata DB content
             update_log(f"Downloaded and extracted text for paper {paper_id} ({file_size:.2f} KB)")
             return f"Downloaded ({file_size:.2f} KB)", pdf_path, text
         else:
@@ -321,6 +377,13 @@ with st.sidebar:
         end_year = st.number_input("End Year", min_value=start_year, max_value=current_year, value=current_year)
     output_formats = st.multiselect("Output Formats", ["SQLite (.db)", "CSV", "JSON"], default=["SQLite (.db)"])
     search_button = st.button("Search arXiv")
+    convert_button = st.button("Update DBs from Existing PDFs")
+
+if convert_button:
+    with st.spinner("Processing existing PDFs..."):
+        batch_convert_pdfs()
+    display_logs()
+    st.success("DB update complete. Check logs for details.")
 
 if search_button:
     if not query.strip():
