@@ -18,7 +18,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 import zipfile
 
 # Define database directory and files
-DB_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.expanduser("~/Desktop")
 METADATA_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_metadata.db")
 UNIVERSE_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_universe.db")
 
