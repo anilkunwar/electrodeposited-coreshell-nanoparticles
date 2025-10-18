@@ -19,6 +19,11 @@ import zipfile
 
 # Define database directory and files
 DB_DIR = os.path.expanduser("~/Desktop")
+# Ensure DB_DIR exists
+if not os.path.exists(DB_DIR):
+    os.makedirs(DB_DIR)
+    st.info(f"Created directory: {DB_DIR}")
+
 METADATA_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_metadata.db")
 UNIVERSE_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_universe.db")
 
