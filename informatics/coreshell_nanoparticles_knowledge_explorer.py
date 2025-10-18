@@ -16,63 +16,144 @@ from collections import Counter
 import numpy as np
 from tenacity import retry, stop_after_attempt, wait_fixed
 import zipfile
+import gc
+import psutil
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import tempfile
 
-# Define database directory and files
-DB_DIR = os.path.expanduser("~/Desktop")
-# Ensure DB_DIR exists
-if not os.path.exists(DB_DIR):
-    os.makedirs(DB_DIR)
-    st.info(f"Created directory: {DB_DIR}")
+# ===== CLOUD-OPTIMIZED CONFIGURATION =====
+# Use temporary directory for cloud environments
+if os.path.exists("/tmp"):  # Cloud environments typically have /tmp
+    DB_DIR = "/tmp"
+else:
+    DB_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
+
+# Ensure directories exist
+os.makedirs(DB_DIR, exist_ok=True)
+pdf_dir = os.path.join(DB_DIR, "pdfs")
+os.makedirs(pdf_dir, exist_ok=True)
 
 METADATA_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_metadata.db")
 UNIVERSE_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_universe.db")
 
 # Initialize logging
-logging.basicConfig(filename=os.path.join(DB_DIR, 'coreshellnanoparticles_query.log'), level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename=os.path.join(DB_DIR, 'coreshellnanoparticles_query.log'), 
+                   level=logging.INFO, 
+                   format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize Streamlit app
 st.set_page_config(page_title="Core-Shell Nanoparticles Query Tool", layout="wide")
 st.title("Core-Shell Nanoparticles Query Tool with SciBERT")
 st.markdown("""
-This tool queries arXiv for papers on **Ag Cu core-shell nanoparticles prepared by electroless deposition**, focusing on aspects such as **thermal stability**, **electric resistivity**, **Ag shell**, **Cu core**, **flexible electronics**, **nanotechnology**, and **applications**. It uses SciBERT to prioritize relevant abstracts (>30% relevance) and stores metadata in `coreshellnanoparticles_metadata.db` and full PDF text in `coreshellnanoparticles_universe.db` for fallback searches. PDFs are stored individually and can be downloaded as a ZIP file.
+This tool queries arXiv for papers on **Ag Cu core-shell nanoparticles prepared by electroless deposition**, focusing on aspects such as **thermal stability**, **electric resistivity**, **Ag shell**, **Cu core**, **flexible electronics**, **nanotechnology**, and **applications**. It uses SciBERT to prioritize relevant abstracts (>30% relevance) and stores metadata in `coreshellnanoparticles_metadata.db` and full PDF text in `coreshellnanoparticles_universe.db` for fallback searches. PDFs and database files are stored individually and can be downloaded as a ZIP file.
 """)
 
 # Dependency check
 st.sidebar.header("Setup")
 st.sidebar.markdown("""
 **Dependencies**:
-- `arxiv`, `pymupdf`, `pandas`, `streamlit`, `transformers`, `torch`, `scipy`, `numpy`, `tenacity`
-- Install: `pip install arxiv pymupdf pandas streamlit transformers torch scipy numpy tenacity`
+- `arxiv`, `pymupdf`, `pandas`, `streamlit`, `transformers`, `torch`, `scipy`, `numpy`, `tenacity`, `requests`, `psutil`
+- Install: `pip install arxiv pymupdf pandas streamlit transformers torch scipy numpy tenacity requests psutil`
 """)
 
-# Load SciBERT model and tokenizer
-try:
-    scibert_tokenizer = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
-    scibert_model = AutoModelForSequenceClassification.from_pretrained("allenai/scibert_scivocab_uncased")
-    scibert_model.eval()
-except Exception as e:
-    st.error(f"Failed to load SciBERT: {e}. Install: `pip install transformers torch`")
-    st.stop()
+# ===== RESOURCE MANAGEMENT =====
+def check_memory_usage():
+    """Check current memory usage"""
+    try:
+        process = psutil.Process()
+        memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+        return memory_usage
+    except:
+        return 0
 
-# Create PDFs directory
-pdf_dir = os.path.join(DB_DIR, "pdfs")
-if not os.path.exists(pdf_dir):
-    os.makedirs(pdf_dir)
-    st.info(f"Created directory: {pdf_dir}")
+def cleanup_memory():
+    """Clean up memory and GPU cache"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-# Initialize session state for logs
+def system_health_check():
+    """Check system resources before processing"""
+    try:
+        memory_usage = check_memory_usage()
+        disk_usage = psutil.disk_usage(DB_DIR)
+        disk_free_gb = disk_usage.free / (1024**3)
+        
+        update_log(f"System health - Memory: {memory_usage:.1f}MB, Disk free: {disk_free_gb:.1f}GB")
+        
+        if memory_usage > 1500:  # 1.5GB
+            st.warning(f"High memory usage ({memory_usage:.1f}MB), processing may be slow")
+            cleanup_memory()
+        if disk_free_gb < 0.5:  # 500MB free space
+            st.error(f"Low disk space ({disk_free_gb:.1f}GB), some operations may fail")
+            return False
+        return True
+    except Exception as e:
+        update_log(f"Health check warning: {str(e)}")
+        return True  # Continue anyway
+
+def create_retry_session():
+    """Create HTTP session with retry strategy"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def limit_pdf_processing(papers, max_pdfs=10):
+    """Limit the number of PDFs processed in cloud environment"""
+    if len(papers) > max_pdfs and os.path.exists("/tmp"):  # Cloud environment
+        st.warning(f"Cloud environment: Limiting to {max_pdfs} PDF downloads")
+        return papers[:max_pdfs]
+    return papers
+
+# ===== SESSION STATE MANAGEMENT =====
 if "log_buffer" not in st.session_state:
     st.session_state.log_buffer = []
+if "processing" not in st.session_state:
+    st.session_state.processing = False
+if "current_progress" not in st.session_state:
+    st.session_state.current_progress = 0
+
+def reset_processing():
+    st.session_state.processing = False
+    st.session_state.current_progress = 0
 
 def update_log(message):
+    """Update log with timestamp"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state.log_buffer.append(f"[{timestamp}] {message}")
+    log_entry = f"[{timestamp}] {message}"
+    st.session_state.log_buffer.append(log_entry)
     if len(st.session_state.log_buffer) > 30:
         st.session_state.log_buffer.pop(0)
     logging.info(message)
 
-# Initialize databases
+# ===== MODEL LOADING =====
+@st.cache_resource
+def load_scibert_model():
+    """Load SciBERT model with caching"""
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
+        model = AutoModelForSequenceClassification.from_pretrained("allenai/scibert_scivocab_uncased")
+        model.eval()
+        update_log("SciBERT model loaded successfully")
+        return tokenizer, model
+    except Exception as e:
+        st.error(f"Failed to load SciBERT: {e}. Install: `pip install transformers torch`")
+        st.stop()
+
+scibert_tokenizer, scibert_model = load_scibert_model()
+
+# ===== DATABASE OPERATIONS =====
 def initialize_db(db_file):
+    """Initialize database schema"""
     try:
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
@@ -128,7 +209,7 @@ def initialize_db(db_file):
 initialize_db(METADATA_DB_FILE)
 initialize_db(UNIVERSE_DB_FILE)
 
-# Define key terms related to core-shell nanoparticles
+# ===== KEY TERMS AND SCORING =====
 KEY_TERMS = [
     "core-shell nanoparticles", "electroless deposition", "thermal stability", "electric resistivity",
     "Ag shell", "Cu core", "flexible electronics", "nanotechnology", "applications",
@@ -136,9 +217,8 @@ KEY_TERMS = [
     "stability", "resistivity", "electronics", "nano"
 ]
 
-# SciBERT scoring with attention mechanism
-@st.cache_data
 def score_abstract_with_scibert(abstract):
+    """Score abstract relevance using SciBERT"""
     try:
         inputs = scibert_tokenizer(abstract, return_tensors="pt", truncation=True, max_length=512, padding=True, return_attention_mask=True)
         with torch.no_grad():
@@ -167,8 +247,9 @@ def score_abstract_with_scibert(abstract):
         update_log(f"Fallback scoring: {relevance_prob:.3f}")
         return relevance_prob
 
-# Extract text from PDF
+# ===== PDF PROCESSING =====
 def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF file"""
     try:
         doc = fitz.open(pdf_path)
         text = ""
@@ -180,8 +261,8 @@ def extract_text_from_pdf(pdf_path):
         update_log(f"PDF extraction failed for {pdf_path}: {str(e)}")
         return f"Error: {str(e)}"
 
-# Update content in DB
 def update_db_content(db_file, paper_id, content):
+    """Update content in database"""
     try:
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
@@ -202,28 +283,46 @@ def update_db_content(db_file, paper_id, content):
     except Exception as e:
         update_log(f"Failed to update content in {db_file} for {paper_id}: {str(e)}")
 
-# Batch convert existing PDFs to DBs
+# ===== BATCH PROCESSING =====
 def batch_convert_pdfs():
+    """Batch convert existing PDFs to databases"""
     pdf_files = [f for f in os.listdir(pdf_dir) if f.endswith('.pdf')]
     if not pdf_files:
         update_log("No PDFs found in directory.")
         return
+    
+    if not system_health_check():
+        st.error("System health check failed. Cannot process PDFs.")
+        return
+        
     progress_bar = st.progress(0)
+    status_text = st.empty()
+    
     for i, filename in enumerate(pdf_files):
         pdf_path = os.path.join(pdf_dir, filename)
         paper_id = filename[:-4]
+        status_text.text(f"Processing {i+1}/{len(pdf_files)}: {filename}")
+        
         text = extract_text_from_pdf(pdf_path)
         if not text.startswith("Error"):
             update_db_content(METADATA_DB_FILE, paper_id, text)
             update_db_content(UNIVERSE_DB_FILE, paper_id, text)
         else:
             update_log(text)
+            
         progress_bar.progress((i + 1) / len(pdf_files))
         time.sleep(0.1)  # Small delay to avoid overwhelming
+        
+        # Clean memory every 5 files
+        if i % 5 == 0:
+            cleanup_memory()
+    
+    status_text.empty()
+    cleanup_memory()
 
-# Create coreshellnanoparticles_universe.db incrementally
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def create_universe_db(paper, db_file=UNIVERSE_DB_FILE):
+    """Create universe database entry"""
     try:
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
@@ -254,8 +353,9 @@ def create_universe_db(paper, db_file=UNIVERSE_DB_FILE):
         update_log(f"Error updating {db_file}: {str(e)}")
         raise
 
-# Save to SQLite
+# ===== DATA STORAGE =====
 def save_to_sqlite(papers_df, params_list, metadata_db_file=METADATA_DB_FILE):
+    """Save data to SQLite database"""
     try:
         initialize_db(metadata_db_file)
         conn = sqlite3.connect(metadata_db_file)
@@ -270,9 +370,10 @@ def save_to_sqlite(papers_df, params_list, metadata_db_file=METADATA_DB_FILE):
         update_log(f"SQLite save failed: {str(e)}")
         return f"Failed to save to SQLite: {str(e)}"
 
-# Query arXiv
-@st.cache_data
+# ===== ARXIV QUERY =====
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def query_arxiv(query, categories, max_results, start_year, end_year):
+    """Query arXiv for papers"""
     try:
         query_terms = query.strip().split()
         formatted_terms = [term.strip('"').replace(" ", "+") for term in query_terms]
@@ -291,7 +392,7 @@ def query_arxiv(query, categories, max_results, start_year, end_year):
                 abstract = result.summary.lower()
                 title = result.title.lower()
                 query_words = set(word.lower().strip('"') for word in query_terms)
-                matched_terms = [word for word in query_words if word in abstract or word in title]
+                matched_terms = [word for word in query_words if word in abstract or in title]
                 if not matched_terms:
                     continue
                 relevance_prob = score_abstract_with_scibert(result.summary)
@@ -324,14 +425,22 @@ def query_arxiv(query, categories, max_results, start_year, end_year):
         st.error(f"Error querying arXiv: {str(e)}. Try simplifying the query.")
         return []
 
-# Download PDF and extract text
+# ===== PDF DOWNLOAD =====
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
+    """Download PDF and extract text"""
     pdf_path = os.path.join(pdf_dir, f"{paper_id}.pdf")
     try:
-        urllib.request.urlretrieve(pdf_url, pdf_path)
+        session = create_retry_session()
+        response = session.get(pdf_url, timeout=30)
+        response.raise_for_status()
+        
+        with open(pdf_path, 'wb') as f:
+            f.write(response.content)
+            
         file_size = os.path.getsize(pdf_path) / 1024
         text = extract_text_from_pdf(pdf_path)
+        
         if not text.startswith("Error"):
             paper_data = {
                 "id": paper_id,
@@ -341,18 +450,20 @@ def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
                 "content": text
             }
             create_universe_db(paper_data)
-            update_db_content(METADATA_DB_FILE, paper_id, text)  # Also update metadata DB content
+            update_db_content(METADATA_DB_FILE, paper_id, text)
             update_log(f"Downloaded and extracted text for paper {paper_id} ({file_size:.2f} KB)")
             return f"Downloaded ({file_size:.2f} KB)", pdf_path, text
         else:
             update_log(f"Text extraction failed for paper {paper_id}: {text}")
             return f"Failed: {text}", None, text
+            
     except Exception as e:
         update_log(f"PDF download failed for {paper_id}: {str(e)}")
         return f"Failed: {str(e)}", None, f"Error: {str(e)}"
 
-# Create ZIP file of PDFs
+# ===== FILE MANAGEMENT =====
 def create_pdf_zip(pdf_paths):
+    """Create ZIP file of PDFs"""
     zip_path = os.path.join(DB_DIR, "coreshellnanoparticles_pdfs.zip")
     with zipfile.ZipFile(zip_path, 'w') as zipf:
         for pdf_path in pdf_paths:
@@ -360,20 +471,22 @@ def create_pdf_zip(pdf_paths):
                 zipf.write(pdf_path, os.path.basename(pdf_path))
     return zip_path
 
-# Main Streamlit app
+# ===== STREAMLIT UI =====
 st.header("arXiv Query for Ag Cu Core-Shell Nanoparticles")
 st.markdown("Search for abstracts on **Ag Cu core-shell nanoparticles** prepared by **electroless deposition**, including **thermal stability**, **electric resistivity**, **Ag shell**, **Cu core**, **flexible electronics**, **nanotechnology**, and **applications** using SciBERT.")
 
 log_container = st.empty()
 def display_logs():
+    """Display processing logs"""
     log_container.text_area("Processing Logs", "\n".join(st.session_state.log_buffer), height=200)
 
+# Sidebar configuration
 with st.sidebar:
     st.subheader("Search Parameters")
     query = st.text_input("Query", value=' OR '.join([f'"{term}"' for term in KEY_TERMS]))
     default_categories = ["cond-mat.mtrl-sci", "physics.app-ph", "physics.chem-ph"]
     categories = st.multiselect("Categories", default_categories, default=default_categories)
-    max_results = st.slider("Max Papers", min_value=1, max_value=500, value=10)
+    max_results = st.slider("Max Papers", min_value=1, max_value=100, value=20)  # Reduced for cloud
     current_year = datetime.now().year
     col1, col2 = st.columns(2)
     with col1:
@@ -381,16 +494,32 @@ with st.sidebar:
     with col2:
         end_year = st.number_input("End Year", min_value=start_year, max_value=current_year, value=current_year)
     output_formats = st.multiselect("Output Formats", ["SQLite (.db)", "CSV", "JSON"], default=["SQLite (.db)"])
+    
+    # Cloud-specific settings
+    st.subheader("Cloud Settings")
+    enable_cloud_limits = st.checkbox("Enable Cloud Optimization", value=os.path.exists("/tmp"))
+    max_pdf_downloads = st.slider("Max PDF Downloads", min_value=1, max_value=20, value=10)
+    
     search_button = st.button("Search arXiv")
     convert_button = st.button("Update DBs from Existing PDFs")
 
+# Main processing
 if convert_button:
-    with st.spinner("Processing existing PDFs..."):
-        batch_convert_pdfs()
-    display_logs()
-    st.success("DB update complete. Check logs for details.")
+    if st.session_state.processing:
+        st.warning("Processing in progress... Please wait.")
+    else:
+        st.session_state.processing = True
+        with st.spinner("Processing existing PDFs..."):
+            batch_convert_pdfs()
+        display_logs()
+        st.success("DB update complete. Check logs for details.")
+        st.session_state.processing = False
 
 if search_button:
+    if st.session_state.processing:
+        st.warning("Processing in progress... Please wait.")
+        st.stop()
+        
     if not query.strip():
         st.error("Enter a valid query.")
     elif not categories:
@@ -398,81 +527,162 @@ if search_button:
     elif start_year > end_year:
         st.error("Start year must be ≤ end year.")
     else:
-        with st.spinner("Querying arXiv..."):
-            papers = query_arxiv(query, categories, max_results, start_year, end_year)
+        st.session_state.processing = True
         
-        if not papers:
-            st.warning("No papers found. Broaden query or categories.")
-        else:
-            st.success(f"Found **{len(papers)}** papers. Filtering for relevance > 30%...")
-            relevant_papers = [p for p in papers if p["relevance_prob"] > 30.0]
-            if not relevant_papers:
-                st.warning("No papers with relevance > 30%. Broaden query or check 'coreshellnanoparticles_query.log'.")
+        try:
+            # Perform health check
+            if not system_health_check():
+                st.error("System health check failed. Please try again later.")
+                reset_processing()
+                st.stop()
+            
+            with st.spinner("Querying arXiv..."):
+                papers = query_arxiv(query, categories, max_results, start_year, end_year)
+            
+            if not papers:
+                st.warning("No papers found. Broaden query or categories.")
             else:
-                st.success(f"**{len(relevant_papers)}** papers with relevance > 30%. Downloading PDFs...")
-                progress_bar = st.progress(0)
-                pdf_paths = []
-                for i, paper in enumerate(relevant_papers):
-                    if paper["pdf_url"]:
-                        status, pdf_path, content = download_pdf_and_extract(paper["pdf_url"], paper["id"], paper)
-                        paper["download_status"] = status
-                        paper["pdf_path"] = pdf_path
-                        paper["content"] = content
-                        if pdf_path:
-                            pdf_paths.append(pdf_path)
-                    progress_bar.progress((i + 1) / len(relevant_papers))
-                    time.sleep(1)  # Avoid rate-limiting
-                    update_log(f"Processed paper {i+1}/{len(relevant_papers)}: {paper['title']}")
+                st.success(f"Found **{len(papers)}** papers. Filtering for relevance > 30%...")
+                relevant_papers = [p for p in papers if p["relevance_prob"] > 30.0]
                 
-                df = pd.DataFrame(relevant_papers)
-                st.subheader("Papers (Relevance > 30%)")
-                st.dataframe(
-                    df[["id", "title", "year", "categories", "abstract_highlighted", "matched_terms", "relevance_prob", "download_status"]],
-                    use_container_width=True
-                )
-                
-                if "SQLite (.db)" in output_formats:
-                    sqlite_status = save_to_sqlite(df.drop(columns=["abstract_highlighted"]), [])
-                    st.info(sqlite_status)
-                
-                if "CSV" in output_formats:
-                    csv = df.drop(columns=["abstract_highlighted"]).to_csv(index=False)
-                    st.download_button(
-                        label="Download Paper Metadata CSV",
-                        data=csv,
-                        file_name="coreshellnanoparticles_papers.csv",
-                        mime="text/csv"
+                if not relevant_papers:
+                    st.warning("No papers with relevance > 30%. Broaden query or check logs.")
+                else:
+                    # Apply cloud limits if enabled
+                    if enable_cloud_limits:
+                        relevant_papers = limit_pdf_processing(relevant_papers, max_pdfs=max_pdf_downloads)
+                    
+                    st.success(f"**{len(relevant_papers)}** papers with relevance > 30%. Downloading PDFs...")
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    pdf_paths = []
+                    
+                    for i, paper in enumerate(relevant_papers):
+                        status_text.text(f"Downloading {i+1}/{len(relevant_papers)}: {paper['title'][:50]}...")
+                        
+                        if paper["pdf_url"]:
+                            status, pdf_path, content = download_pdf_and_extract(paper["pdf_url"], paper["id"], paper)
+                            paper["download_status"] = status
+                            paper["pdf_path"] = pdf_path
+                            paper["content"] = content
+                            if pdf_path:
+                                pdf_paths.append(pdf_path)
+                        
+                        progress_bar.progress((i + 1) / len(relevant_papers))
+                        time.sleep(1)  # Avoid rate-limiting
+                        update_log(f"Processed paper {i+1}/{len(relevant_papers)}: {paper['title']}")
+                        
+                        # Clean memory every 3 papers
+                        if i % 3 == 0:
+                            cleanup_memory()
+                    
+                    status_text.empty()
+                    progress_bar.empty()
+                    
+                    # Display results
+                    df = pd.DataFrame(relevant_papers)
+                    st.subheader("Papers (Relevance > 30%)")
+                    st.dataframe(
+                        df[["id", "title", "year", "categories", "abstract_highlighted", "matched_terms", "relevance_prob", "download_status"]],
+                        use_container_width=True
                     )
-                
-                if "JSON" in output_formats:
-                    json_data = df.drop(columns=["abstract_highlighted"]).to_json(orient="records", lines=True)
-                    st.download_button(
-                        label="Download Paper Metadata JSON",
-                        data=json_data,
-                        file_name="coreshellnanoparticles_papers.json",
-                        mime="application/json"
-                    )
-                
-                # Display individual PDF links
-                if pdf_paths:
-                    st.subheader("Individual PDF Downloads")
-                    for pdf_path in pdf_paths:
-                        with open(pdf_path, "rb") as f:
+                    
+                    # Export data
+                    if "SQLite (.db)" in output_formats:
+                        sqlite_status = save_to_sqlite(df.drop(columns=["abstract_highlighted"]), [])
+                        st.info(sqlite_status)
+                    
+                    if "CSV" in output_formats:
+                        csv = df.drop(columns=["abstract_highlighted"]).to_csv(index=False)
+                        st.download_button(
+                            label="Download Paper Metadata CSV",
+                            data=csv,
+                            file_name="coreshellnanoparticles_papers.csv",
+                            mime="text/csv"
+                        )
+                    
+                    if "JSON" in output_formats:
+                        json_data = df.drop(columns=["abstract_highlighted"]).to_json(orient="records", lines=True)
+                        st.download_button(
+                            label="Download Paper Metadata JSON",
+                            data=json_data,
+                            file_name="coreshellnanoparticles_papers.json",
+                            mime="application/json"
+                        )
+                    
+                    # Display individual PDF links
+                    if pdf_paths:
+                        st.subheader("Individual PDF Downloads")
+                        for pdf_path in pdf_paths:
+                            with open(pdf_path, "rb") as f:
+                                st.download_button(
+                                    label=f"Download {os.path.basename(pdf_path)}",
+                                    data=f,
+                                    file_name=os.path.basename(pdf_path),
+                                    mime="application/pdf"
+                                )
+                        
+                        # ZIP download
+                        zip_path = create_pdf_zip(pdf_paths)
+                        with open(zip_path, "rb") as f:
                             st.download_button(
-                                label=f"Download {os.path.basename(pdf_path)}",
+                                label="Download All PDFs as ZIP",
                                 data=f,
-                                file_name=os.path.basename(pdf_path),
-                                mime="application/pdf"
+                                file_name="coreshellnanoparticles_pdfs.zip",
+                                mime="application/zip"
                             )
                     
-                    # ZIP download
-                    zip_path = create_pdf_zip(pdf_paths)
-                    with open(zip_path, "rb") as f:
-                        st.download_button(
-                            label="Download All PDFs as ZIP",
-                            data=f,
-                            file_name="coreshellnanoparticles_pdfs.zip",
-                            mime="application/zip"
-                        )
+                    # Database file downloads
+                    st.subheader("Database Downloads")
+                    if os.path.exists(METADATA_DB_FILE):
+                        with open(METADATA_DB_FILE, "rb") as f:
+                            st.download_button(
+                                label="Download Metadata Database",
+                                data=f,
+                                file_name="coreshellnanoparticles_metadata.db",
+                                mime="application/octet-stream"
+                            )
+                    else:
+                        st.warning(f"Metadata database ({METADATA_DB_FILE}) not found.")
+                    
+                    if os.path.exists(UNIVERSE_DB_FILE):
+                        with open(UNIVERSE_DB_FILE, "rb") as f:
+                            st.download_button(
+                                label="Download Universe Database",
+                                data=f,
+                                file_name="coreshellnanoparticles_universe.db",
+                                mime="application/octet-stream"
+                            )
+                    else:
+                        st.warning(f"Universe database ({UNIVERSE_DB_FILE}) not found.")
                 
                 display_logs()
+                
+        except Exception as e:
+            st.error(f"Processing failed: {str(e)}")
+            update_log(f"Processing error: {str(e)}")
+        finally:
+            reset_processing()
+            cleanup_memory()
+
+# Display system info in sidebar
+with st.sidebar:
+    st.subheader("System Info")
+    memory_usage = check_memory_usage()
+    st.write(f"Memory usage: {memory_usage:.1f} MB")
+    st.write(f"Database dir: {DB_DIR}")
+    if st.button("Clear Memory Cache"):
+        cleanup_memory()
+        st.success("Memory cache cleared")
+
+# Display logs if available
+if st.session_state.log_buffer:
+    with st.sidebar:
+        st.subheader("Recent Logs")
+        for log in list(st.session_state.log_buffer)[-5:]:
+            st.text(log)
+
+# Add footer
+st.markdown("---")
+st.markdown("*Cloud-optimized version - Designed for stable deployment in cloud environments*")
