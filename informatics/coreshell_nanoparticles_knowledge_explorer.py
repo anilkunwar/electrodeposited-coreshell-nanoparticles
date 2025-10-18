@@ -2,7 +2,6 @@ import arxiv
 import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
-import urllib.request
 import os
 import re
 import sqlite3
@@ -22,6 +21,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import tempfile
+import json
 
 # ===== CLOUD-OPTIMIZED CONFIGURATION =====
 if os.path.exists("/tmp"):  # Cloud environments typically have /tmp
@@ -122,19 +122,23 @@ if "current_progress" not in st.session_state:
     st.session_state.current_progress = 0
 if "download_files" not in st.session_state:
     st.session_state.download_files = {"pdf_paths": [], "zip_path": None}
-if "download_triggered" not in st.session_state:
-    st.session_state.download_triggered = False
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
+if "relevant_papers" not in st.session_state:
+    st.session_state.relevant_papers = None
+if "search_params" not in st.session_state:
+    st.session_state.search_params = None
 
 def reset_processing():
     """Reset processing state"""
     st.session_state.processing = False
     st.session_state.current_progress = 0
-    st.session_state.download_triggered = False
 
 def reset_downloads():
     """Reset download-related state and clear cache"""
     st.session_state.download_files = {"pdf_paths": [], "zip_path": None}
-    st.session_state.download_triggered = False
+    st.session_state.search_results = None
+    st.session_state.relevant_papers = None
     query_arxiv.clear()  # Clear the arXiv query cache
     cleanup_memory()
     update_log("Download state and cache cleared")
@@ -384,7 +388,7 @@ def save_to_sqlite(papers_df, params_list, metadata_db_file=METADATA_DB_FILE):
         return f"Failed to save to SQLite: {str(e)}"
 
 # ===== ARXIV QUERY =====
-@st.cache_data(ttl=3600)
+@st.cache_data(hash_funcs={list: lambda x: str(x), tuple: lambda x: str(x)}, ttl=3600)
 def query_arxiv(query, categories, max_results, start_year, end_year):
     """Query arXiv for papers"""
     try:
@@ -443,8 +447,8 @@ def query_arxiv(query, categories, max_results, start_year, end_year):
 def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
     """Download PDF and extract text"""
     pdf_path = os.path.join(pdf_dir, f"{paper_id}.pdf")
+    session = create_retry_session()
     try:
-        session = create_retry_session()
         response = session.get(pdf_url, timeout=30)
         response.raise_for_status()
         
@@ -467,14 +471,14 @@ def download_pdf_and_extract(pdf_url, paper_id, paper_metadata):
             update_log(f"Downloaded and extracted text for paper {paper_id} ({file_size:.2f} KB)")
             return f"Downloaded ({file_size:.2f} KB)", pdf_path, text
         else:
-            update_log(f"Text extraction failed for paper {paper_id}: {text}")
+            update_log(f"Text extraction failed for {paper_id}: {text}")
             return f"Failed: {text}", None, text
             
     except Exception as e:
         update_log(f"PDF download failed for {paper_id}: {str(e)}")
         return f"Failed: {str(e)}", None, f"Error: {str(e)}"
     finally:
-        session.close()  # Ensure session is closed
+        session.close()
 
 # ===== FILE MANAGEMENT =====
 def create_pdf_zip(pdf_paths):
@@ -512,26 +516,26 @@ def display_logs():
 # Sidebar configuration
 with st.sidebar:
     st.subheader("Search Parameters")
-    query = st.text_input("Query", value=' OR '.join([f'"{term}"' for term in KEY_TERMS]))
+    query = st.text_input("Query", value=' OR '.join([f'"{term}"' for term in KEY_TERMS]), key="query_input")
     default_categories = ["cond-mat.mtrl-sci", "physics.app-ph", "physics.chem-ph"]
-    categories = st.multiselect("Categories", default_categories, default=default_categories)
-    max_results = st.slider("Max Papers", min_value=1, max_value=100, value=20)
+    categories = st.multiselect("Categories", default_categories, default=default_categories, key="categories_select")
+    max_results = st.slider("Max Papers", min_value=1, max_value=100, value=20, key="max_results_slider")
     current_year = datetime.now().year
     col1, col2 = st.columns(2)
     with col1:
-        start_year = st.number_input("Start Year", min_value=1990, max_value=current_year, value=2010)
+        start_year = st.number_input("Start Year", min_value=1990, max_value=current_year, value=2010, key="start_year_input")
     with col2:
-        end_year = st.number_input("End Year", min_value=start_year, max_value=current_year, value=current_year)
-    output_formats = st.multiselect("Output Formats", ["SQLite (.db)", "CSV", "JSON"], default=["SQLite (.db)"])
+        end_year = st.number_input("End Year", min_value=start_year, max_value=current_year, value=current_year, key="end_year_input")
+    output_formats = st.multiselect("Output Formats", ["SQLite (.db)", "CSV", "JSON"], default=["SQLite (.db)"], key="output_formats_select")
     
     # Cloud-specific settings
     st.subheader("Cloud Settings")
-    enable_cloud_limits = st.checkbox("Enable Cloud Optimization", value=os.path.exists("/tmp"))
-    max_pdf_downloads = st.slider("Max PDF Downloads", min_value=1, max_value=20, value=10)
+    enable_cloud_limits = st.checkbox("Enable Cloud Optimization", value=os.path.exists("/tmp"), key="cloud_optimization_checkbox")
+    max_pdf_downloads = st.slider("Max PDF Downloads", min_value=1, max_value=20, value=10, key="max_pdf_downloads_slider")
     
-    search_button = st.button("Search arXiv")
-    convert_button = st.button("Update DBs from Existing PDFs")
-    reset_downloads_button = st.button("Reset Downloads")
+    search_button = st.button("Search arXiv", key="search_button")
+    convert_button = st.button("Update DBs from Existing PDFs", key="convert_button")
+    reset_downloads_button = st.button("Reset Downloads", key="reset_downloads_button")
 
 # Reset downloads if button clicked
 if reset_downloads_button:
@@ -550,6 +554,100 @@ if convert_button:
         st.success("DB update complete. Check logs for details.")
         st.session_state.processing = False
 
+# Restore previous search results if available
+if st.session_state.search_results and st.session_state.relevant_papers:
+    papers = st.session_state.search_results
+    relevant_papers = st.session_state.relevant_papers
+    df = pd.DataFrame(relevant_papers)
+    st.subheader("Papers (Relevance > 30%)")
+    st.dataframe(
+        df[["id", "title", "year", "categories", "abstract_highlighted", "matched_terms", "relevance_prob", "download_status"]],
+        use_container_width=True
+    )
+    
+    # Restore download buttons
+    if "SQLite (.db)" in output_formats:
+        sqlite_status = save_to_sqlite(df.drop(columns=["abstract_highlighted"]), [])
+        st.info(sqlite_status)
+    
+    if "CSV" in output_formats:
+        csv = df.drop(columns=["abstract_highlighted"]).to_csv(index=False)
+        st.download_button(
+            label="Download Paper Metadata CSV",
+            data=csv,
+            file_name="coreshellnanoparticles_papers.csv",
+            mime="text/csv",
+            key="csv_download"
+        )
+    
+    if "JSON" in output_formats:
+        json_data = df.drop(columns=["abstract_highlighted"]).to_json(orient="records", lines=True)
+        st.download_button(
+            label="Download Paper Metadata JSON",
+            data=json_data,
+            file_name="coreshellnanoparticles_papers.json",
+            mime="application/json",
+            key="json_download"
+        )
+    
+    # Display individual PDF links
+    pdf_paths = st.session_state.download_files.get("pdf_paths", [])
+    if pdf_paths:
+        st.subheader("Individual PDF Downloads")
+        for idx, pdf_path in enumerate(pdf_paths):
+            file_data = read_file_for_download(pdf_path)
+            if file_data:
+                st.download_button(
+                    label=f"Download {os.path.basename(pdf_path)}",
+                    data=file_data,
+                    file_name=os.path.basename(pdf_path),
+                    mime="application/pdf",
+                    key=f"pdf_download_{idx}_{time.time()}"
+                )
+    
+        # ZIP download
+        zip_path = st.session_state.download_files.get("zip_path")
+        if zip_path and os.path.exists(zip_path):
+            file_data = read_file_for_download(zip_path)
+            if file_data:
+                st.download_button(
+                    label="Download All PDFs as ZIP",
+                    data=file_data,
+                    file_name="coreshellnanoparticles_pdfs.zip",
+                    mime="application/zip",
+                    key=f"zip_download_{time.time()}"
+                )
+    
+    # Database file downloads
+    st.subheader("Database Downloads")
+    if os.path.exists(METADATA_DB_FILE):
+        file_data = read_file_for_download(METADATA_DB_FILE)
+        if file_data:
+            st.download_button(
+                label="Download Metadata Database",
+                data=file_data,
+                file_name="coreshellnanoparticles_metadata.db",
+                mime="application/octet-stream",
+                key=f"metadata_db_download_{time.time()}"
+            )
+    else:
+        st.warning(f"Metadata database ({METADATA_DB_FILE}) not found.")
+    
+    if os.path.exists(UNIVERSE_DB_FILE):
+        file_data = read_file_for_download(UNIVERSE_DB_FILE)
+        if file_data:
+            st.download_button(
+                label="Download Universe Database",
+                data=file_data,
+                file_name="coreshellnanoparticles_universe.db",
+                mime="application/octet-stream",
+                key=f"universe_db_download_{time.time()}"
+            )
+    else:
+        st.warning(f"Universe database ({UNIVERSE_DB_FILE}) not found.")
+    
+    display_logs()
+
 if search_button:
     if st.session_state.processing:
         st.warning("Processing in progress... Please wait.")
@@ -564,6 +662,13 @@ if search_button:
     else:
         st.session_state.processing = True
         st.session_state.download_files = {"pdf_paths": [], "zip_path": None}
+        st.session_state.search_params = {
+            "query": query,
+            "categories": categories,
+            "max_results": max_results,
+            "start_year": start_year,
+            "end_year": end_year
+        }
         
         try:
             # Perform health check
@@ -616,7 +721,9 @@ if search_button:
                     status_text.empty()
                     progress_bar.empty()
                     
-                    # Store PDF paths in session state
+                    # Store results in session state
+                    st.session_state.search_results = papers
+                    st.session_state.relevant_papers = relevant_papers
                     st.session_state.download_files["pdf_paths"] = pdf_paths
                     
                     # Display results
@@ -639,7 +746,7 @@ if search_button:
                             data=csv,
                             file_name="coreshellnanoparticles_papers.csv",
                             mime="text/csv",
-                            key="csv_download"
+                            key=f"csv_download_{time.time()}"
                         )
                     
                     if "JSON" in output_formats:
@@ -647,9 +754,9 @@ if search_button:
                         st.download_button(
                             label="Download Paper Metadata JSON",
                             data=json_data,
-                            file_name="coreshellnanoparticles_pdfs.json",
+                            file_name="coreshellnanoparticles_papers.json",
                             mime="application/json",
-                            key="json_download"
+                            key=f"json_download_{time.time()}"
                         )
                     
                     # Display individual PDF links
@@ -663,7 +770,7 @@ if search_button:
                                     data=file_data,
                                     file_name=os.path.basename(pdf_path),
                                     mime="application/pdf",
-                                    key=f"pdf_download_{idx}"
+                                    key=f"pdf_download_{idx}_{time.time()}"
                                 )
                         
                         # ZIP download
@@ -677,7 +784,7 @@ if search_button:
                                     data=file_data,
                                     file_name="coreshellnanoparticles_pdfs.zip",
                                     mime="application/zip",
-                                    key="zip_download"
+                                    key=f"zip_download_{time.time()}"
                                 )
                     
                     # Database file downloads
@@ -690,7 +797,7 @@ if search_button:
                                 data=file_data,
                                 file_name="coreshellnanoparticles_metadata.db",
                                 mime="application/octet-stream",
-                                key="metadata_db_download"
+                                key=f"metadata_db_download_{time.time()}"
                             )
                     else:
                         st.warning(f"Metadata database ({METADATA_DB_FILE}) not found.")
@@ -703,7 +810,7 @@ if search_button:
                                 data=file_data,
                                 file_name="coreshellnanoparticles_universe.db",
                                 mime="application/octet-stream",
-                                key="universe_db_download"
+                                key=f"universe_db_download_{time.time()}"
                             )
                     else:
                         st.warning(f"Universe database ({UNIVERSE_DB_FILE}) not found.")
@@ -723,7 +830,7 @@ with st.sidebar:
     memory_usage = check_memory_usage()
     st.write(f"Memory usage: {memory_usage:.1f} MB")
     st.write(f"Database dir: {DB_DIR}")
-    if st.button("Clear Memory Cache"):
+    if st.button("Clear Memory Cache", key="clear_memory_cache"):
         cleanup_memory()
         st.success("Memory cache cleared")
 
