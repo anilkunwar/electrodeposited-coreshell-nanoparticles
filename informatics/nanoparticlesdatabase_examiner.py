@@ -19,7 +19,8 @@ from itertools import chain, combinations
 import uuid
 import seaborn as sns
 from sklearn.metrics.pairwise import cosine_similarity
-from community import community_louvain  # pip install python-louvain
+from community import community_louvain
+from datetime import datetime
 
 # Matplotlib configuration
 plt.rcParams.update({
@@ -36,16 +37,36 @@ plt.rcParams.update({
 })
 
 # Directory setup for adjacent folder
-DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../databases")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.join(SCRIPT_DIR, "../databases")
 METADATA_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_metadata.db")
 UNIVERSE_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_universe.db")
 
+# Ensure DB_DIR exists
+try:
+    os.makedirs(DB_DIR, exist_ok=True)
+except Exception as e:
+    st.error(f"Failed to create database directory {DB_DIR}: {str(e)}")
+    # Fallback to script directory for logging
+    DB_DIR = SCRIPT_DIR
+    st.warning(f"Falling back to script directory {DB_DIR} for logging.")
+
 # Logging setup
-logging.basicConfig(
-    filename=os.path.join(DB_DIR, 'coreshell_analysis.log'),
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+LOG_FILE = os.path.join(DB_DIR, 'coreshell_analysis.log')
+try:
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+except Exception as e:
+    st.error(f"Failed to configure logging to {LOG_FILE}: {str(e)}")
+    # Fallback to console logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    st.warning("Logging to console due to file access issue.")
 
 # Streamlit configuration
 st.set_page_config(page_title="Core-Shell Nanoparticles Analysis Tool (SciBERT)", layout="wide")
@@ -812,6 +833,10 @@ def visualize_knowledge_graph_communities(G):
 
 # Database selection
 st.header("Select or Upload Database")
+if not os.path.exists(DB_DIR):
+    st.error(f"Database directory {DB_DIR} does not exist. Please ensure databases are uploaded to the correct folder.")
+    os.makedirs(DB_DIR, exist_ok=True)
+    st.info(f"Created directory {DB_DIR}. Please upload database files.")
 db_files = [f for f in os.listdir(DB_DIR) if f.endswith('.db')] if os.path.exists(DB_DIR) else []
 db_options = db_files + ["Upload a new .db file"]
 default_index = db_options.index(os.path.basename(UNIVERSE_DB_FILE)) if os.path.basename(UNIVERSE_DB_FILE) in db_options else 0
@@ -822,12 +847,19 @@ if db_selection == "Upload a new .db file":
     uploaded_file = st.file_uploader("Upload SQLite Database (.db)", type=["db"], key="db_upload")
     if uploaded_file:
         temp_db_path = os.path.join(DB_DIR, f"uploaded_{uuid.uuid4().hex}.db")
-        with open(temp_db_path, "wb") as f:
-            f.write(uploaded_file.read())
-        st.session_state.db_file = temp_db_path
-        update_log(f"Uploaded database saved as {temp_db_path}")
+        try:
+            with open(temp_db_path, "wb") as f:
+                f.write(uploaded_file.read())
+            st.session_state.db_file = temp_db_path
+            update_log(f"Uploaded database saved as {temp_db_path}")
+        except Exception as e:
+            st.error(f"Failed to save uploaded database: {str(e)}")
+            update_log(f"Failed to save uploaded database: {str(e)}")
 else:
     st.session_state.db_file = os.path.join(DB_DIR, db_selection)
+    if not os.path.exists(st.session_state.db_file):
+        st.error(f"Selected database {os.path.basename(st.session_state.db_file)} not found.")
+        update_log(f"Selected database {os.path.basename(st.session_state.db_file)} not found.")
 
 # Main app logic
 if st.session_state.db_file and os.path.exists(st.session_state.db_file):
@@ -1033,5 +1065,5 @@ st.markdown("""
 - **Knowledge Graph**: Visualizes relationships between categories and terms with community detection.
 - **NER Analysis**: Extracts entities with numerical values and units, enhanced with knowledge graph relationships.
 - The script dynamically adjusts to missing columns or tables.
-- Check `coreshell_analysis.log` for detailed logs.
+- Check `coreshell_analysis.log` for detailed logs (in the databases folder or console if directory creation failed).
 """)
