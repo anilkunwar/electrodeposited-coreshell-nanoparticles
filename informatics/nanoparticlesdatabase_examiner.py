@@ -1,3 +1,4 @@
+```python
 import sqlite3
 import streamlit as st
 import re
@@ -46,7 +47,6 @@ def update_log(message):
     logging.info(message)
 
 # ===== DATABASE CONNECTION =====
-@st.cache_resource
 def connect_to_db(db_file):
     """Connect to SQLite database"""
     try:
@@ -58,25 +58,26 @@ def connect_to_db(db_file):
         st.error(f"Failed to connect to {db_file}: {str(e)}")
         return None
 
-metadata_conn = connect_to_db(METADATA_DB_FILE)
-universe_conn = connect_to_db(UNIVERSE_DB_FILE)
-
 # ===== FETCH PAPERS =====
-@st.cache_data
-def fetch_papers(conn):
+def fetch_papers(db_file):
     """Fetch papers from the database"""
+    conn = connect_to_db(db_file)
     if conn:
         try:
             df = pd.read_sql_query("SELECT * FROM papers", conn)
-            update_log(f"Fetched {len(df)} papers from database")
+            update_log(f"Fetched {len(df)} papers from {db_file}")
+            conn.close()
             return df
         except Exception as e:
-            update_log(f"Failed to fetch papers: {str(e)}")
-            st.error(f"Failed to fetch papers: {str(e)}")
+            update_log(f"Failed to fetch papers from {db_file}: {str(e)}")
+            st.error(f"Failed to fetch papers from {db_file}: {str(e)}")
+        finally:
+            conn.close()
     return pd.DataFrame()
 
-metadata_df = fetch_papers(metadata_conn)
-universe_df = fetch_papers(universe_conn)
+# Fetch papers from both databases
+metadata_df = fetch_papers(METADATA_DB_FILE)
+universe_df = fetch_papers(UNIVERSE_DB_FILE)
 
 # ===== FIELDS OF INTEREST =====
 # Predefined fields with patterns (regex to extract values near keywords)
@@ -102,7 +103,6 @@ def extract_fields_from_text(text):
 
 def suggest_new_fields(text):
     """Suggest new fields based on frequency of phrases near numbers"""
-    # Find patterns like "keyword: number unit"
     patterns = re.findall(r"(\w+(?:\s+\w+)?)\s*[:=]\s*([\d\.eE\-]+)\s*(\w+)", text, re.IGNORECASE)
     counter = Counter([match[0].lower() for match in patterns])
     suggested = [field for field, count in counter.most_common(10) if count > 1 and field not in FIELDS]
@@ -114,7 +114,7 @@ if not metadata_df.empty:
     st.dataframe(metadata_df[["id", "title", "year", "relevance_prob", "download_status"]])
 
     # Select paper to inspect
-    selected_id = st.selectbox("Select Paper ID to Inspect", metadata_df["id"].tolist())
+    selected_id = st.selectbox("Select Paper ID to Inspect", metadata_df["id"].tolist(), key="paper_select")
 
     if selected_id:
         # Get full content (prefer universe db if available)
@@ -126,10 +126,10 @@ if not metadata_df.empty:
             content = content_row.iloc[0]["content"]
             if content and not content.startswith("Error"):
                 st.subheader(f"Full Text for Paper {selected_id}")
-                st.text_area("Content Preview (first 2000 chars)", content[:2000] + "..." if len(content) > 2000 else content, height=300)
+                st.text_area("Content Preview (first 2000 chars)", content[:2000] + "..." if len(content) > 2000 else content, height=300, key=f"content_preview_{selected_id}")
                 
                 # Extract fields
-                if st.button("Extract Fields"):
+                if st.button("Extract Fields", key=f"extract_fields_{selected_id}"):
                     extracted = extract_fields_from_text(content)
                     st.session_state.extracted_fields[selected_id] = extracted
                     update_log(f"Extracted fields for paper {selected_id}")
@@ -141,7 +141,7 @@ if not metadata_df.empty:
                     st.dataframe(extracted_df)
                 
                 # Suggest new fields
-                if st.button("Suggest New Fields"):
+                if st.button("Suggest New Fields", key=f"suggest_fields_{selected_id}"):
                     suggested = suggest_new_fields(content)
                     if suggested:
                         st.subheader("Suggested New Fields")
@@ -158,8 +158,9 @@ else:
 
 # Display logs
 st.subheader("Logs")
-display_logs = st.text_area("Recent Logs", "\n".join(st.session_state.log_buffer), height=200)
+st.text_area("Recent Logs", "\n".join(st.session_state.log_buffer), height=200, key="logs_display")
 
 # Add footer
 st.markdown("---")
 st.markdown("*Database Inspector - Extracts and suggests fields from full text content*")
+```
