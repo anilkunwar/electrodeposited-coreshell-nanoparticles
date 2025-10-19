@@ -12,6 +12,7 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from wordcloud import WordCloud
+import uuid  # Added to fix NameError
 
 # ===== CONFIGURATION =====
 # Use temporary directory for cloud environments
@@ -373,4 +374,3 @@ else:
 # Footer
 st.markdown("---")
 st.markdown("*Database Inspector - Extracts and suggests fields like shell diameter, resistivity using regex and SciBERT*")
-
