@@ -19,8 +19,7 @@ from itertools import chain, combinations
 import uuid
 import seaborn as sns
 from sklearn.metrics.pairwise import cosine_similarity
-from community import community_louvain
-from datetime import datetime
+from community import community_louvain  # pip install python-louvain
 
 # Matplotlib configuration
 plt.rcParams.update({
@@ -36,20 +35,19 @@ plt.rcParams.update({
     'savefig.transparent': True
 })
 
-# Directory setup for adjacent folder
+# Directory setup
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_DIR = os.path.join(SCRIPT_DIR, "../databases")
-METADATA_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_metadata.db")
-UNIVERSE_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_universe.db")
+DB_DIR = SCRIPT_DIR  # Load from the same directory as the script
 
-# Ensure DB_DIR exists
+# Ensure DB_DIR exists (though it should as it's the script dir)
 try:
     os.makedirs(DB_DIR, exist_ok=True)
 except Exception as e:
-    st.error(f"Failed to create database directory {DB_DIR}: {str(e)}")
-    # Fallback to script directory for logging
-    DB_DIR = SCRIPT_DIR
-    st.warning(f"Falling back to script directory {DB_DIR} for logging.")
+    st.error(f"Failed to access directory {DB_DIR}: {str(e)}")
+    st.stop()
+
+METADATA_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_metadata.db")
+UNIVERSE_DB_FILE = os.path.join(DB_DIR, "coreshellnanoparticles_universe.db")
 
 # Logging setup
 LOG_FILE = os.path.join(DB_DIR, 'coreshell_analysis.log')
@@ -61,7 +59,6 @@ try:
     )
 except Exception as e:
     st.error(f"Failed to configure logging to {LOG_FILE}: {str(e)}")
-    # Fallback to console logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
@@ -72,7 +69,7 @@ except Exception as e:
 st.set_page_config(page_title="Core-Shell Nanoparticles Analysis Tool (SciBERT)", layout="wide")
 st.title("Core-Shell Nanoparticles Analysis: Dimensions, Electrical, Thermal Properties")
 st.markdown("""
-This tool inspects SQLite databases, categorizes terms related to core-shell nanoparticles (e.g., shell diameter, core diameter, resistivity, thermal stability, deposition time), builds a knowledge graph, and performs NER analysis using SciBERT. The default database is `coreshellnanoparticles_universe.db` for full-text analysis.
+This tool inspects SQLite databases (`coreshellnanoparticles_metadata.db` and `coreshellnanoparticles_universe.db`), categorizes terms related to core-shell nanoparticles (e.g., shell diameter, core diameter, resistivity, thermal stability, deposition time), builds a knowledge graph, and performs NER analysis using SciBERT. The default database is `coreshellnanoparticles_universe.db` for full-text analysis of arXiv papers.
 Select a database, then use the tabs to inspect the database, categorize terms, visualize relationships, or extract entities with numerical values.
 """)
 
@@ -125,9 +122,13 @@ if "ner_results" not in st.session_state:
 if "categorized_terms" not in st.session_state:
     st.session_state.categorized_terms = None
 if "db_file" not in st.session_state:
-    st.session_state.db_file = UNIVERSE_DB_FILE if os.path.exists(UNIVERSE_DB_FILE) else None
+    st.session_state.db_file = UNIVERSE_DB_FILE if os.path.exists(UNIVERSE_DB_FILE) else None  # Default to coreshellnanoparticles_universe.db if it exists
 if "term_counts" not in st.session_state:
     st.session_state.term_counts = None
+if "csv_data" not in st.session_state:
+    st.session_state.csv_data = None
+if "csv_filename" not in st.session_state:
+    st.session_state.csv_filename = None
 if "knowledge_graph" not in st.session_state:
     st.session_state.knowledge_graph = None
 
@@ -138,7 +139,7 @@ def update_log(message):
         st.session_state.log_buffer.pop(0)
     logging.info(message)
 
-@st.cache_data(hash_funcs={str: lambda x: x})
+@st.cache_data
 def get_scibert_embedding(text):
     try:
         if not text.strip():
@@ -163,86 +164,127 @@ def inspect_database(db_path):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [table[0] for table in cursor.fetchall()]
+        tables = cursor.fetchall()
         st.subheader("Tables in Database")
         if tables:
-            st.write(tables)
+            st.write([table[0] for table in tables])
         else:
             st.warning("No tables found in the database.")
             conn.close()
             return None
 
-        table_name = "papers"
-        if table_name not in tables:
-            st.warning(f"No 'papers' table found. Available tables: {', '.join(tables)}")
-            table_name = st.selectbox("Select Table", tables, key="table_select")
-        
-        st.subheader(f"Schema of '{table_name}' Table")
-        cursor.execute(f"PRAGMA table_info({table_name});")
-        schema = cursor.fetchall()
-        schema_df = pd.DataFrame(schema, columns=["cid", "name", "type", "notnull", "dflt_value", "pk"])
-        st.dataframe(schema_df[["name", "type", "notnull", "dflt_value", "pk"]], use_container_width=True)
-        available_columns = [col[1] for col in schema]
-        update_log(f"Available columns in '{table_name}' table: {', '.join(available_columns)}")
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='papers';")
+        if cursor.fetchone():
+            st.subheader("Schema of 'papers' Table")
+            cursor.execute("PRAGMA table_info(papers);")
+            schema = cursor.fetchall()
+            schema_df = pd.DataFrame(schema, columns=["cid", "name", "type", "notnull", "dflt_value", "pk"])
+            st.dataframe(schema_df[["name", "type", "notnull", "dflt_value", "pk"]], use_container_width=True)
+            available_columns = [col[1] for col in schema]
+            update_log(f"Available columns in 'papers' table: {', '.join(available_columns)}")
 
-        # Build dynamic query for sample data
-        select_columns = ["id", "title", "year"] if "id" in available_columns and "title" in available_columns else available_columns[:3]
-        if "content" in available_columns:
-            select_columns.append("substr(content, 1, 200) as sample_content")
-        if "abstract" in available_columns:
-            select_columns.append("substr(abstract, 1, 200) as sample_abstract")
-        if "relevance_prob" in available_columns:
-            select_columns.append("relevance_prob")
+            # Build dynamic query for sample data
+            select_columns = ["id", "title", "year"]
+            where_conditions = []
+            if "content" in available_columns:
+                select_columns.append("substr(content, 1, 200) as sample_content")
+                where_conditions.append("content IS NOT NULL")
+            if "abstract" in available_columns:
+                select_columns.append("substr(abstract, 1, 200) as sample_abstract")
+                where_conditions.append("abstract IS NOT NULL")
+            if "matched_terms" in available_columns:
+                select_columns.append("matched_terms")
+            if "relevance_prob" in available_columns:
+                select_columns.append("relevance_prob")
 
-        query = f"SELECT {', '.join(select_columns)} FROM {table_name} LIMIT 5"
-        try:
-            df = pd.read_sql_query(query, conn)
-            st.subheader(f"Sample Rows from '{table_name}' Table (First 5 Papers)")
-            if df.empty:
-                st.warning(f"No valid papers found in the '{table_name}' table.")
+            if not where_conditions:
+                where_clause = "1=1"
             else:
-                st.dataframe(df, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error executing sample query: {str(e)}")
-            update_log(f"Error executing sample query: {str(e)}")
+                where_clause = " OR ".join(where_conditions)
+
+            query = f"SELECT {', '.join(select_columns)} FROM papers WHERE {where_clause} LIMIT 5"
+            try:
+                df = pd.read_sql_query(query, conn)
+                st.subheader("Sample Rows from 'papers' Table (First 5 Papers)")
+                if df.empty:
+                    st.warning("No valid papers found in the 'papers' table.")
+                else:
+                    st.dataframe(df, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error executing sample query: {str(e)}")
+                update_log(f"Error executing sample query: {str(e)}")
+                conn.close()
+                return None
+
+            # Count total valid papers
+            total_query = f"SELECT COUNT(*) as count FROM papers WHERE {where_clause}"
+            cursor.execute(total_query)
+            total_papers = cursor.fetchone()[0]
+            st.subheader("Total Valid Papers")
+            st.write(f"{total_papers} papers")
+
+            # Term frequency analysis
+            terms_to_search = ["shell diameter", "core diameter", "shell thickness", "resistivity", "thermal stability", "deposition time", "particle size"]
+            st.subheader("Term Frequency in Available Text Columns")
+            term_counts = {}
+            for term in terms_to_search:
+                conditions = []
+                if "abstract" in available_columns:
+                    conditions.append(f"abstract LIKE '%{term}%'")
+                if "content" in available_columns:
+                    conditions.append(f"content LIKE '%{term}%'")
+                if conditions:
+                    term_query = f"SELECT COUNT(*) FROM papers WHERE {' OR '.join(conditions)}"
+                    cursor.execute(term_query)
+                    count = cursor.fetchone()[0]
+                    term_counts[term] = count
+                    st.write(f"'{term}': {count} papers")
+                else:
+                    st.write(f"'{term}': Unable to search (no abstract or content columns)")
+                    update_log(f"Unable to search for '{term}': no abstract or content columns")
+
+            # Sample data for download
+            select_columns_download = ["id", "title", "year"]
+            if "content" in available_columns:
+                select_columns_download.append("substr(content, 1, 1000) as content")
+            if "abstract" in available_columns:
+                select_columns_download.append("substr(abstract, 1, 1000) as abstract")
+            if "matched_terms" in available_columns:
+                select_columns_download.append("matched_terms")
+            if "relevance_prob" in available_columns:
+                select_columns_download.append("relevance_prob")
+
+            query = f"SELECT {', '.join(select_columns_download)} FROM papers WHERE {where_clause} LIMIT 10"
+            try:
+                df_full = pd.read_sql_query(query, conn)
+                csv_filename = f"database_sample_{uuid.uuid4().hex}.csv"
+                csv_path = os.path.join(DB_DIR, csv_filename)
+                df_full.to_csv(csv_path, index=False)
+                with open(csv_path, "rb") as f:
+                    st.session_state.csv_data = f.read()
+                st.session_state.csv_filename = csv_filename
+                st.subheader("Download Sample Content")
+                st.download_button(
+                    label="Download Sample CSV",
+                    data=st.session_state.csv_data,
+                    file_name="database_sample.csv",
+                    mime="text/csv",
+                    key="download_csv"
+                )
+            except Exception as e:
+                st.error(f"Error generating sample CSV: {str(e)}")
+                update_log(f"Error generating sample CSV: {str(e)}")
+
+            conn.close()
+            st.success(f"Database inspection completed for {os.path.basename(db_path)}")
+            return term_counts
+        else:
+            st.warning("No 'papers' table found in the database.")
             conn.close()
             return None
-
-        # Count total valid papers
-        total_query = f"SELECT COUNT(*) as count FROM {table_name} WHERE {'content IS NOT NULL' if 'content' in available_columns else '1=1'}"
-        cursor.execute(total_query)
-        total_papers = cursor.fetchone()[0]
-        st.subheader("Total Valid Papers")
-        st.write(f"{total_papers} papers")
-
-        # Term frequency analysis
-        terms_to_search = ["shell diameter", "core diameter", "shell thickness", "resistivity", "thermal stability", "deposition time", "particle size"]
-        st.subheader("Term Frequency in Available Text Columns")
-        term_counts = {}
-        for term in terms_to_search:
-            conditions = []
-            if "abstract" in available_columns:
-                conditions.append(f"abstract LIKE '%{term}%'")
-            if "content" in available_columns:
-                conditions.append(f"content LIKE '%{term}%'")
-            if conditions:
-                term_query = f"SELECT COUNT(*) FROM {table_name} WHERE {' OR '.join(conditions)}"
-                cursor.execute(term_query)
-                count = cursor.fetchone()[0]
-                term_counts[term] = count
-                st.write(f"'{term}': {count} papers")
-            else:
-                st.write(f"'{term}': Unable to search (no abstract or content columns)")
-                update_log(f"Unable to search for '{term}': no abstract or content columns")
-
-        conn.close()
-        st.success(f"Database inspection completed for {os.path.basename(db_path)}")
-        return term_counts
     except Exception as e:
         st.error(f"Error reading database {os.path.basename(db_path)}: {str(e)}")
         update_log(f"Error reading database {os.path.basename(db_path)}: {str(e)}")
-        if 'conn' in locals():
-            conn.close()
         return None
 
 @st.cache_data(hash_funcs={str: lambda x: x})
@@ -324,7 +366,7 @@ def categorize_terms(db_file, similarity_threshold=0.7, min_freq=5):
         # Sort terms by frequency within each category
         for cat in categorized_terms:
             categorized_terms[cat] = sorted(categorized_terms[cat], key=lambda x: x[1], reverse=True)
-        categorized_terms["Other"] = sorted(other_terms, key=lambda x: x[1], reverse=True)[:50]
+        categorized_terms["Other"] = sorted(other_terms, key=lambda x: x[1], reverse=True)[:50]  # Limit other terms to top 50
         
         update_log(f"Categorized {sum(len(terms) for terms in categorized_terms.values())} terms across {len(categorized_terms)} categories")
         return categorized_terms, term_freqs
@@ -344,12 +386,12 @@ def build_knowledge_graph_data(categorized_terms, db_file, min_co_occurrence=2, 
 
         G = nx.Graph()
         
-        # Add category nodes
+        # Add category nodes with enhanced attributes
         categories = list(categorized_terms.keys())
         for cat in categories:
             G.add_node(cat, type="category", freq=0, size=2000, color="skyblue")
         
-        # Add all terms as nodes
+        # Add all terms as nodes with enhanced attributes
         term_freqs = {}
         term_units = {
             "Dimensions": "nm",
@@ -359,11 +401,13 @@ def build_knowledge_graph_data(categorized_terms, db_file, min_co_occurrence=2, 
             "Other": "various"
         }
         
+        # Create a mapping of all terms to their categories
         term_to_category = {}
         for cat, terms in categorized_terms.items():
             for term, freq, _ in terms:
                 term_to_category[term] = cat
         
+        # Add all terms as nodes with proper categorization
         for cat, terms in categorized_terms.items():
             for term, freq, score in terms[:top_n]:
                 G.add_node(term, type="term", 
@@ -374,7 +418,7 @@ def build_knowledge_graph_data(categorized_terms, db_file, min_co_occurrence=2, 
                 G.add_edge(cat, term, weight=1.0, type="category-term", label="belongs_to")
                 term_freqs[term] = freq
         
-        # Compute co-occurrences
+        # Compute co-occurrences with enhanced relationship detection
         co_occurrence_counts = defaultdict(lambda: defaultdict(int))
         
         for content in df["content"].values:
@@ -394,10 +438,11 @@ def build_knowledge_graph_data(categorized_terms, db_file, min_co_occurrence=2, 
                         co_occurrence_counts[term1][term2] += 1
                         co_occurrence_counts[term2][term1] += 1
         
-        # Add co-occurrence edges
+        # Add co-occurrence edges with enhanced attributes
         for term1, related_terms in co_occurrence_counts.items():
             for term2, count in related_terms.items():
                 if count >= min_co_occurrence and term1 in G.nodes and term2 in G.nodes:
+                    # Determine relationship type based on categories
                     cat1 = term_to_category.get(term1, "Other")
                     cat2 = term_to_category.get(term2, "Other")
                     
@@ -408,12 +453,14 @@ def build_knowledge_graph_data(categorized_terms, db_file, min_co_occurrence=2, 
                         rel_type = "inter_category"
                         label = f"related_to ({count})"
                     
+                    # Add edge with enhanced attributes
                     G.add_edge(term1, term2, weight=count, type="term-term", 
                               relationship=rel_type, label=label, strength=count)
         
-        # Add hierarchical relationships
+        # Add hierarchical relationships between terms
         for term in list(G.nodes):
             if G.nodes[term].get("type") == "term":
+                # Find parent terms (shorter terms that are substrings)
                 for potential_parent in list(G.nodes):
                     if (G.nodes[potential_parent].get("type") == "term" and 
                         potential_parent != term and 
@@ -455,6 +502,9 @@ def build_knowledge_graph_data(categorized_terms, db_file, min_co_occurrence=2, 
         return None, None
 
 def enhance_ner_with_knowledge_graph(ner_df, knowledge_graph):
+    """
+    Enhance NER results using knowledge graph insights
+    """
     if ner_df.empty or knowledge_graph is None:
         return ner_df
     
@@ -464,22 +514,28 @@ def enhance_ner_with_knowledge_graph(ner_df, knowledge_graph):
         entity_text = row["entity_text"]
         entity_label = row["entity_label"]
         
+        # Find related entities in the knowledge graph
         if entity_text in knowledge_graph.nodes:
+            # Get neighbors in the knowledge graph
             neighbors = list(knowledge_graph.neighbors(entity_text))
             
+            # Find related terms with strong connections
             strong_connections = []
             for neighbor in neighbors:
                 edge_data = knowledge_graph.get_edge_data(entity_text, neighbor)
-                if edge_data and edge_data.get("strength", 0) > 3:
+                if edge_data and edge_data.get("strength", 0) > 3:  # Threshold for strong connection
                     strong_connections.append((neighbor, edge_data.get("strength", 0)))
             
+            # Sort by strength
             strong_connections.sort(key=lambda x: x[1], reverse=True)
             
+            # Add context from knowledge graph
             context_enhanced = row["context"]
             if strong_connections:
                 related_terms = ", ".join([f"{term}({strength})" for term, strength in strong_connections[:3]])
                 context_enhanced += f" [KG: Related to {related_terms}]"
             
+            # Create enhanced row
             enhanced_row = row.to_dict()
             enhanced_row["context"] = context_enhanced
             enhanced_row["kg_related_terms"] = ", ".join([term for term, _ in strong_connections])
@@ -634,7 +690,7 @@ def perform_ner_on_terms(db_file, selected_terms):
                                 unit_score = np.dot(context_embedding, unit_embedding) / (np.linalg.norm(context_embedding) * np.linalg.norm(unit_embedding))
                                 if unit_score > 0.6:
                                     unit_valid = True
-                                    unit = v_unit
+                                    unit = v_unit  # Correct to the valid unit if close
                                     break
                             if not unit_valid:
                                 continue
@@ -756,7 +812,7 @@ def plot_ner_value_histograms(df, categories_units, top_n, colormap):
     figs = []
     for category, unit in categories_units.items():
         cat_df = value_df[value_df["entity_label"] == category]
-        if unit:
+        if unit:  # If a specific unit is requested
             cat_df = cat_df[cat_df["unit"] == unit]
         if cat_df.empty:
             update_log(f"No data for {category} with unit {unit}")
@@ -768,7 +824,7 @@ def plot_ner_value_histograms(df, categories_units, top_n, colormap):
             continue
         
         fig, ax = plt.subplots(figsize=(8, 4))
-        color = cm.get_cmap(colormap)(0.5)
+        color = cm.get_cmap(colormap)(0.5)  # Use a consistent color from colormap
         ax.hist(values, bins=20, color=color, edgecolor="black")
         ax.set_xlabel(f"Value ({unit})")
         ax.set_ylabel("Count")
@@ -779,20 +835,23 @@ def plot_ner_value_histograms(df, categories_units, top_n, colormap):
     return figs
 
 def visualize_knowledge_graph_communities(G):
+    """
+    Visualize the knowledge graph with community detection
+    """
     if G is None or not G.edges():
         return None
     
-    # Detect communities
+    # Detect communities using Louvain method
     partition = community_louvain.best_partition(G)
     
-    # Color map for communities
+    # Create a color map for communities
     communities = set(partition.values())
     color_map = cm.get_cmap('tab20', len(communities))
     
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 10))
     
-    # Position nodes
+    # Position nodes using spring layout
     pos = nx.spring_layout(G, k=1, iterations=50, seed=42)
     
     # Draw nodes with community colors
@@ -806,13 +865,13 @@ def visualize_knowledge_graph_communities(G):
                    for _, _, d in G.edges(data=True)]
     nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.5, edge_color='gray', ax=ax)
     
-    # Draw labels
+    # Draw labels only for important nodes
     important_nodes = [node for node in G.nodes() if G.nodes[node].get('type') == 'category' or 
                       G.nodes[node].get('freq', 0) > 10]
     labels = {node: node for node in important_nodes}
     nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight='bold', ax=ax)
     
-    # Add legend
+    # Add legend for community colors
     community_labels = {}
     for node, comm_id in partition.items():
         if G.nodes[node].get('type') == 'category':
@@ -833,33 +892,30 @@ def visualize_knowledge_graph_communities(G):
 
 # Database selection
 st.header("Select or Upload Database")
-if not os.path.exists(DB_DIR):
-    st.error(f"Database directory {DB_DIR} does not exist. Please ensure databases are uploaded to the correct folder.")
-    os.makedirs(DB_DIR, exist_ok=True)
-    st.info(f"Created directory {DB_DIR}. Please upload database files.")
-db_files = [f for f in os.listdir(DB_DIR) if f.endswith('.db')] if os.path.exists(DB_DIR) else []
-db_options = db_files + ["Upload a new .db file"]
+db_files = glob.glob(os.path.join(DB_DIR, "*.db"))
+db_options = [os.path.basename(f) for f in db_files if f in [METADATA_DB_FILE, UNIVERSE_DB_FILE]] + ["Upload a new .db file"]
+# Ensure coreshellnanoparticles_universe.db is included and set as default
+if os.path.basename(UNIVERSE_DB_FILE) not in db_options and os.path.exists(UNIVERSE_DB_FILE):
+    db_options.insert(0, os.path.basename(UNIVERSE_DB_FILE))
 default_index = db_options.index(os.path.basename(UNIVERSE_DB_FILE)) if os.path.basename(UNIVERSE_DB_FILE) in db_options else 0
 db_selection = st.selectbox("Select Database", db_options, index=default_index, key="db_select")
-
 uploaded_file = None
 if db_selection == "Upload a new .db file":
     uploaded_file = st.file_uploader("Upload SQLite Database (.db)", type=["db"], key="db_upload")
     if uploaded_file:
         temp_db_path = os.path.join(DB_DIR, f"uploaded_{uuid.uuid4().hex}.db")
-        try:
-            with open(temp_db_path, "wb") as f:
-                f.write(uploaded_file.read())
-            st.session_state.db_file = temp_db_path
-            update_log(f"Uploaded database saved as {temp_db_path}")
-        except Exception as e:
-            st.error(f"Failed to save uploaded database: {str(e)}")
-            update_log(f"Failed to save uploaded database: {str(e)}")
+        with open(temp_db_path, "wb") as f:
+            f.write(uploaded_file.read())
+        st.session_state.db_file = temp_db_path
+        update_log(f"Uploaded database saved as {temp_db_path}")
 else:
-    st.session_state.db_file = os.path.join(DB_DIR, db_selection)
-    if not os.path.exists(st.session_state.db_file):
-        st.error(f"Selected database {os.path.basename(st.session_state.db_file)} not found.")
-        update_log(f"Selected database {os.path.basename(st.session_state.db_file)} not found.")
+    if db_selection == os.path.basename(METADATA_DB_FILE):
+        st.session_state.db_file = METADATA_DB_FILE
+    elif db_selection == os.path.basename(UNIVERSE_DB_FILE):
+        st.session_state.db_file = UNIVERSE_DB_FILE
+    else:
+        st.session_state.db_file = os.path.join(DB_DIR, db_selection)
+    update_log(f"Selected database: {db_selection}")
 
 # Main app logic
 if st.session_state.db_file and os.path.exists(st.session_state.db_file):
@@ -885,12 +941,12 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
             colormap = st.selectbox("Color Map", ["viridis", "plasma", "inferno", "magma", "hot", "cool", "rainbow"], key="colormap")
         
         if analyze_terms_button:
-            if os.path.exists(st.session_state.db_file):
-                with st.spinner(f"Categorizing terms from {os.path.basename(st.session_state.db_file)}..."):
-                    st.session_state.categorized_terms, st.session_state.term_counts = categorize_terms(st.session_state.db_file, similarity_threshold, min_freq)
+            if os.path.exists(UNIVERSE_DB_FILE):
+                with st.spinner(f"Categorizing terms from {os.path.basename(UNIVERSE_DB_FILE)}..."):
+                    st.session_state.categorized_terms, st.session_state.term_counts = categorize_terms(UNIVERSE_DB_FILE, similarity_threshold, min_freq)
             else:
-                st.error(f"Cannot categorize terms: {os.path.basename(st.session_state.db_file)} not found.")
-                update_log(f"Cannot categorize terms: {os.path.basename(st.session_state.db_file)} not found.")
+                st.error(f"Cannot categorize terms: {os.path.basename(UNIVERSE_DB_FILE)} not found.")
+                update_log(f"Cannot categorize terms: {os.path.basename(UNIVERSE_DB_FILE)} not found.")
         
         if st.session_state.categorized_terms:
             filtered_terms = {cat: [(t, f, s) for t, f, s in terms if not any(w in t.lower() for w in exclude_words)] for cat, terms in st.session_state.categorized_terms.items()}
@@ -914,38 +970,48 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
         st.header("Knowledge Graph")
         if st.button("Build Knowledge Graph", key="build_graph"):
             if st.session_state.categorized_terms:
-                if os.path.exists(st.session_state.db_file):
+                if os.path.exists(UNIVERSE_DB_FILE):
                     with st.spinner("Building knowledge graph..."):
-                        G, csv_data = build_knowledge_graph_data(st.session_state.categorized_terms, st.session_state.db_file, min_co_occurrence=min_freq, top_n=top_n)
+                        G, csv_data = build_knowledge_graph_data(st.session_state.categorized_terms, UNIVERSE_DB_FILE, min_co_occurrence=min_freq, top_n=top_n)
                         if G and G.edges():
+                            # Create the figure here instead of in the cached function
                             fig, ax = plt.subplots(figsize=(12, 10))
                             pos = nx.spring_layout(G, k=1, iterations=50, seed=42)
                             
+                            # Color nodes by type
                             node_colors = []
                             node_sizes = []
                             for node in G.nodes:
                                 if G.nodes[node]["type"] == "category":
                                     node_colors.append("skyblue")
                                     node_sizes.append(2000)
+                                elif G.nodes[node]["type"] == "component":
+                                    node_colors.append("lightgreen")
+                                    node_sizes.append(1500)
                                 else:
                                     node_colors.append("salmon")
                                     node_sizes.append(G.nodes[node].get("size", 500))
                             
+                            # Draw nodes
                             nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.8, ax=ax)
                             
+                            # Draw edges with different styles based on type
                             term_term_edges = [(u, v) for u, v, d in G.edges(data=True) if d["type"] == "term-term"]
                             category_term_edges = [(u, v) for u, v, d in G.edges(data=True) if d["type"] == "category-term"]
                             hierarchical_edges = [(u, v) for u, v, d in G.edges(data=True) if d["type"] == "hierarchical"]
                             
+                            # Draw edges with different styles
                             nx.draw_networkx_edges(G, pos, edgelist=term_term_edges, width=1.0, alpha=0.5, edge_color="gray", ax=ax)
                             nx.draw_networkx_edges(G, pos, edgelist=category_term_edges, width=2.0, alpha=0.7, edge_color="blue", ax=ax)
                             nx.draw_networkx_edges(G, pos, edgelist=hierarchical_edges, width=1.5, alpha=0.7, edge_color="green", style="dashed", ax=ax)
                             
+                            # Draw labels only for important nodes
                             important_nodes = [node for node in G.nodes() if G.nodes[node].get('type') == 'category' or 
                                               G.nodes[node].get('freq', 0) > 10]
                             labels = {node: node for node in important_nodes}
                             nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight='bold', ax=ax)
                             
+                            # Add legend
                             from matplotlib.lines import Line2D
                             legend_elements = [
                                 Line2D([0], [0], color='blue', lw=2, label='Category-Term'),
@@ -959,6 +1025,7 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
                             
                             st.pyplot(fig)
                             
+                            # Show community detection visualization
                             st.subheader("Community Detection")
                             community_fig = visualize_knowledge_graph_communities(G)
                             if community_fig:
@@ -982,8 +1049,8 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
                         else:
                             st.warning("No knowledge graph generated. Check logs.")
                 else:
-                    st.error(f"Cannot build knowledge graph: {os.path.basename(st.session_state.db_file)} not found.")
-                    update_log(f"Cannot build knowledge graph: {os.path.basename(st.session_state.db_file)} not found.")
+                    st.error(f"Cannot build knowledge graph: {os.path.basename(UNIVERSE_DB_FILE)} not found.")
+                    update_log(f"Cannot build knowledge graph: {os.path.basename(UNIVERSE_DB_FILE)} not found.")
             else:
                 st.warning("Run term categorization first.")
         st.text_area("Logs", "\n".join(st.session_state.log_buffer), height=150, key="graph_logs")
@@ -1001,6 +1068,7 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
             default_terms = [term for term in ["shell diameter", "core diameter", "shell thickness", "resistivity", "thermal stability", "deposition time", "particle size"] if term in available_terms]
             selected_terms = st.multiselect("Select Terms for NER", available_terms, default=default_terms, key="select_terms")
             
+            # Add option to use knowledge graph for NER enhancement
             use_kg_enhancement = st.checkbox("Use Knowledge Graph for NER Enhancement", value=True, 
                                            help="Use knowledge graph relationships to improve NER results")
             
@@ -1008,15 +1076,16 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
                 if not selected_terms:
                     st.warning("Select at least one term for NER analysis.")
                 else:
-                    if os.path.exists(st.session_state.db_file):
+                    if os.path.exists(UNIVERSE_DB_FILE):
                         with st.spinner(f"Processing NER analysis for {len(selected_terms)} terms..."):
-                            ner_df = perform_ner_on_terms(st.session_state.db_file, selected_terms)
+                            ner_df = perform_ner_on_terms(UNIVERSE_DB_FILE, selected_terms)
                             st.session_state.ner_results = ner_df
                         if ner_df.empty:
                             st.warning("No entities were found.")
                         else:
                             st.success(f"Extracted {len(ner_df)} entities!")
                             
+                            # Show enhanced NER results if knowledge graph was used
                             if use_kg_enhancement and "kg_related_terms" in ner_df.columns:
                                 st.subheader("NER Results Enhanced with Knowledge Graph")
                                 st.dataframe(
@@ -1038,6 +1107,7 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
                             fig_box = plot_ner_value_boxplot(ner_df, top_n, colormap)
                             if fig_box:
                                 st.pyplot(fig_box)
+                            # Plot histograms for numerical values with specified units
                             categories_units = {
                                 "Dimensions": "nm",
                                 "Electrical Properties": "Ω·m",
@@ -1052,8 +1122,8 @@ if st.session_state.db_file and os.path.exists(st.session_state.db_file):
                             else:
                                 st.warning("No numerical values available for histogram plotting.")
                     else:
-                        st.error(f"Cannot perform NER analysis: {os.path.basename(st.session_state.db_file)} not found.")
-                        update_log(f"Cannot perform NER analysis: {os.path.basename(st.session_state.db_file)} not found.")
+                        st.error(f"Cannot perform NER analysis: {os.path.basename(UNIVERSE_DB_FILE)} not found.")
+                        update_log(f"Cannot perform NER analysis: {os.path.basename(UNIVERSE_DB_FILE)} not found.")
         st.text_area("Logs", "\n".join(st.session_state.log_buffer), height=150, key="ner_logs")
 
 # Notes
@@ -1064,6 +1134,6 @@ st.markdown("""
 - **Term Categorization**: Groups terms into Dimensions, Electrical Properties, Thermal Properties, Deposition using SciBERT embeddings from full-text content.
 - **Knowledge Graph**: Visualizes relationships between categories and terms with community detection.
 - **NER Analysis**: Extracts entities with numerical values and units, enhanced with knowledge graph relationships.
-- The script dynamically adjusts to missing columns or tables.
-- Check `coreshell_analysis.log` for detailed logs (in the databases folder or console if directory creation failed).
+- The script dynamically adjusts to missing columns (e.g., `categories`, `abstract`) by querying only available columns.
+- Check `coreshell_analysis.log` for detailed logs, including schema details and query adjustments.
 """)
