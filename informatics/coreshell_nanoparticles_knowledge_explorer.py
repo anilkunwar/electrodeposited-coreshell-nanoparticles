@@ -531,7 +531,7 @@ with st.sidebar:
     # Cloud-specific settings
     st.subheader("Cloud Settings")
     enable_cloud_limits = st.checkbox("Enable Cloud Optimization", value=os.path.exists("/tmp"), key="cloud_optimization_checkbox")
-    max_pdf_downloads = st.slider("Max PDF Downloads", min_value=1, max_value=20, value=10, key="max_pdf_downloads_slider")
+    max_pdf_downloads = st.slider("Max PDF Downloads", min_value=1, max_value=200, value=10, key="max_pdf_downloads_slider")
     
     search_button = st.button("Search arXiv", key="search_button")
     convert_button = st.button("Update DBs from Existing PDFs", key="convert_button")
