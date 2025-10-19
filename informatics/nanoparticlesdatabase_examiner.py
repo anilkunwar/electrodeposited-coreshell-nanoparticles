@@ -1,4 +1,3 @@
-```python
 import sqlite3
 import streamlit as st
 import re
@@ -163,4 +162,4 @@ st.text_area("Recent Logs", "\n".join(st.session_state.log_buffer), height=200, 
 # Add footer
 st.markdown("---")
 st.markdown("*Database Inspector - Extracts and suggests fields from full text content*")
-```
+
