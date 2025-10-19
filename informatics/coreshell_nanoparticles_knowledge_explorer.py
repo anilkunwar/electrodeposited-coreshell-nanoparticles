@@ -519,7 +519,7 @@ with st.sidebar:
     query = st.text_input("Query", value=' OR '.join([f'"{term}"' for term in KEY_TERMS]), key="query_input")
     default_categories = ["cond-mat.mtrl-sci", "physics.app-ph", "physics.chem-ph"]
     categories = st.multiselect("Categories", default_categories, default=default_categories, key="categories_select")
-    max_results = st.slider("Max Papers", min_value=1, max_value=100, value=20, key="max_results_slider")
+    max_results = st.slider("Max Papers", min_value=1, max_value=1000, value=200, key="max_results_slider")
     current_year = datetime.now().year
     col1, col2 = st.columns(2)
     with col1:
