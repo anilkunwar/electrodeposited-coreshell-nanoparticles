@@ -1,4 +1,3 @@
-```python
 import sqlite3
 import streamlit as st
 import re
@@ -374,4 +373,4 @@ else:
 # Footer
 st.markdown("---")
 st.markdown("*Database Inspector - Extracts and suggests fields like shell diameter, resistivity using regex and SciBERT*")
-```
+
